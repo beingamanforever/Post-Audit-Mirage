@@ -5,6 +5,11 @@ import sys
 from pathlib import Path
 
 from .dataset import build_dataset, load_templates
+from .environment_validation import (
+    NODE_EVALUATOR,
+    build_planning,
+    validate_environments,
+)
 from .surface_generation import (
     DEFAULT_ENDPOINT,
     SurfaceGenerationError,
@@ -37,6 +42,27 @@ def _parser() -> argparse.ArgumentParser:
         default=DATA_DIR / "surface_variants.jsonl",
     )
     dataset.add_argument("--output-dir", type=Path, default=DATA_DIR)
+
+    planning = commands.add_parser("build-planning")
+    planning.add_argument(
+        "--templates",
+        type=Path,
+        default=DATA_DIR / "planning_templates.json",
+    )
+    planning.add_argument("--output-dir", type=Path, default=DATA_DIR)
+    planning.add_argument("--seed", type=int, default=20260820)
+    planning.add_argument("--instances-per-template", type=int, default=2)
+    planning.add_argument("--node-evaluator", type=Path, default=NODE_EVALUATOR)
+
+    validation = commands.add_parser("validate-environments")
+    validation.add_argument(
+        "--templates",
+        type=Path,
+        default=DATA_DIR / "planning_templates.json",
+    )
+    validation.add_argument("--seed", type=int, default=20260820)
+    validation.add_argument("--instances-per-template", type=int, default=2)
+    validation.add_argument("--node-evaluator", type=Path, default=NODE_EVALUATOR)
     return parser
 
 
@@ -52,15 +78,37 @@ def main() -> int:
             )
             print(f"wrote {count} surface variants to {arguments.output}")
             return 0
-        audit_count, truth_count = build_dataset(
+        if arguments.command == "build-dataset":
+            audit_count, truth_count = build_dataset(
+                arguments.templates,
+                arguments.surfaces,
+                arguments.output_dir,
+            )
+            print(
+                f"wrote {audit_count} audit rows and {truth_count} truth rows "
+                f"to {arguments.output_dir}"
+            )
+            return 0
+        if arguments.command == "build-planning":
+            proposer_count, audit_count, truth_count = build_planning(
+                arguments.templates,
+                arguments.output_dir,
+                seed=arguments.seed,
+                instances_per_template=arguments.instances_per_template,
+                node_path=arguments.node_evaluator,
+            )
+            print(
+                f"wrote {proposer_count} proposer rows, {audit_count} audit rows, "
+                f"and {truth_count} truth rows to {arguments.output_dir}"
+            )
+            return 0
+        instances, _ = validate_environments(
             arguments.templates,
-            arguments.surfaces,
-            arguments.output_dir,
+            seed=arguments.seed,
+            instances_per_template=arguments.instances_per_template,
+            node_path=arguments.node_evaluator,
         )
-        print(
-            f"wrote {audit_count} audit rows and {truth_count} truth rows "
-            f"to {arguments.output_dir}"
-        )
+        print(f"validated both exact evaluators on {len(instances)} planning instances")
         return 0
     except (OSError, ValueError, SurfaceGenerationError) as error:
         print(f"error: {error}", file=sys.stderr)

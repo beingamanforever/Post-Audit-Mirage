@@ -25,6 +25,7 @@ from src.authgate import (
     reachable_states,
 )
 from src.dataset import build_dataset, canonical_json_bytes
+from src.environment_validation import build_planning
 from src.surface_generation import MODEL, RETURNED_MODELS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +33,11 @@ TEMPLATES = ROOT / "data" / "templates.json"
 SURFACES = ROOT / "data" / "surface_variants.jsonl"
 AUDIT = ROOT / "data" / "audit.jsonl"
 TRUTH = ROOT / "data" / "truth.jsonl"
+PLANNING_TEMPLATES = ROOT / "data" / "planning_templates.json"
+PLANNING_PROPOSER = ROOT / "data" / "planning_proposer.jsonl"
+PLANNING_AUDIT = ROOT / "data" / "planning_audit.jsonl"
+PLANNING_TRUTH = ROOT / "data" / "planning_truth.jsonl"
+NODE_EVALUATOR = ROOT / "src" / "exact_evaluator.js"
 
 
 def _handler(invalid_model: bool) -> type[BaseHTTPRequestHandler]:
@@ -508,6 +514,195 @@ class ProjectEndToEndTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual((output / "audit.jsonl").read_bytes(), audit_before)
                 self.assertEqual((output / "truth.jsonl").read_bytes(), truth_before)
+
+    def test_complete_phase2_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            built = self.run_cli(
+                "build-planning",
+                "--templates",
+                str(PLANNING_TEMPLATES),
+                "--output-dir",
+                str(output),
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            validated = self.run_cli(
+                "validate-environments",
+                "--templates",
+                str(PLANNING_TEMPLATES),
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+
+            proposer = read_jsonl(output / "planning_proposer.jsonl")
+            audits = read_jsonl(output / "planning_audit.jsonl")
+            truths = read_jsonl(output / "planning_truth.jsonl")
+            self.assertEqual((len(proposer), len(audits), len(truths)), (6, 48, 96))
+            self.assertEqual(
+                (output / "planning_proposer.jsonl").read_bytes(),
+                PLANNING_PROPOSER.read_bytes(),
+            )
+            self.assertEqual(
+                (output / "planning_audit.jsonl").read_bytes(),
+                PLANNING_AUDIT.read_bytes(),
+            )
+            self.assertEqual(
+                (output / "planning_truth.jsonl").read_bytes(),
+                PLANNING_TRUTH.read_bytes(),
+            )
+
+            forbidden = {
+                "category",
+                "cooldowns",
+                "expected_categories",
+                "group",
+                "policies",
+                "protected_blackouts",
+                "seed",
+                "split",
+                "world",
+            }
+            for row in proposer:
+                encoded = json.dumps(row, sort_keys=True)
+                self.assertTrue(all(f'"{field}"' not in encoded for field in forbidden))
+            for row in audits:
+                self.assertNotIn("world", row)
+                self.assertNotIn("category", row)
+
+            expected_categories = {
+                "audit_aware_overfit",
+                "delayed_harm",
+                "genuine_improvement",
+                "incumbent",
+                "neutral_change",
+                "ordinary_regression",
+                "proxy_spec_gaming",
+                "rare_rule_violation",
+            }
+            categories_by_split: dict[str, set[str]] = {}
+            for row in truths:
+                categories_by_split.setdefault(row["split"], set()).add(row["category"])
+            self.assertEqual(
+                set(categories_by_split),
+                {"development", "diagnostic", "confirmation"},
+            )
+            self.assertTrue(
+                all(
+                    items == expected_categories
+                    for items in categories_by_split.values()
+                )
+            )
+            delayed = [
+                row
+                for row in truths
+                if row["category"] == "delayed_harm" and row["world"] == "harmful"
+            ]
+            self.assertTrue(delayed)
+            self.assertTrue(
+                all(row["delayed_violation_slot"] is not None for row in delayed)
+            )
+
+    def test_phase2_mutations_fail_without_replacing_outputs(self) -> None:
+        source = NODE_EVALUATOR.read_text(encoding="utf-8")
+        mutations = {
+            "transition": (
+                "const DELAYED_HARM = rational(9n, 49n);",
+                "const DELAYED_HARM = rational(8n, 49n);",
+            ),
+            "delayed_accounting": (
+                'return TERMINAL.has(state) || (auditOnly && state === "audit_complete");',
+                'return TERMINAL.has(state) || (true && state === "audit_complete");',
+            ),
+            "constraint_parsing": (
+                "const blackouts = instance.protected_blackouts;",
+                "const blackouts = [];",
+            ),
+            "rare_group": (
+                'blackout.group === "rare"',
+                'blackout.group === "common"',
+            ),
+        }
+        for name, (before, after) in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(source.count(before), 1)
+                root = Path(directory)
+                evaluator = root / "exact_evaluator.js"
+                evaluator.write_text(source.replace(before, after), encoding="utf-8")
+                output = root / "output"
+                output.mkdir()
+                previous = {
+                    "planning_audit.jsonl": b"previous audit\n",
+                    "planning_proposer.jsonl": b"previous proposer\n",
+                    "planning_truth.jsonl": b"previous truth\n",
+                }
+                for filename, content in previous.items():
+                    (output / filename).write_bytes(content)
+
+                result = self.run_cli(
+                    "build-planning",
+                    "--templates",
+                    str(PLANNING_TEMPLATES),
+                    "--output-dir",
+                    str(output),
+                    "--node-evaluator",
+                    str(evaluator),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("disagree", result.stderr)
+                for filename, content in previous.items():
+                    self.assertEqual((output / filename).read_bytes(), content)
+
+    def test_phase2_held_out_and_publication_failures(self) -> None:
+        previous = {
+            "planning_audit.jsonl": b"previous audit\n",
+            "planning_proposer.jsonl": b"previous proposer\n",
+            "planning_truth.jsonl": b"previous truth\n",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            templates = root / "planning_templates.json"
+            rows = json.loads(PLANNING_TEMPLATES.read_text(encoding="utf-8"))
+            rows[0]["overfit_start"] = 3
+            templates.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+            output = root / "output"
+            output.mkdir()
+            for filename, content in previous.items():
+                (output / filename).write_bytes(content)
+            result = self.run_cli(
+                "build-planning",
+                "--templates",
+                str(templates),
+                "--output-dir",
+                str(output),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("held-out overfit", result.stderr)
+            for filename, content in previous.items():
+                self.assertEqual((output / filename).read_bytes(), content)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for filename, content in previous.items():
+                (output / filename).write_bytes(content)
+            target = output / "planning_proposer.jsonl"
+            real_replace = os.replace
+            failure_injected = False
+
+            def fail_proposer_once(source: Path, destination: Path) -> None:
+                nonlocal failure_injected
+                if Path(destination) == target and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected planning publication failure")
+                real_replace(source, destination)
+
+            with (
+                patch("src.dataset.os.replace", side_effect=fail_proposer_once),
+                self.assertRaises(OSError),
+            ):
+                build_planning(PLANNING_TEMPLATES, output, seed=20260820)
+
+            self.assertTrue(failure_injected)
+            for filename, content in previous.items():
+                self.assertEqual((output / filename).read_bytes(), content)
 
 
 if __name__ == "__main__":

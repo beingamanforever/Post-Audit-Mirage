@@ -204,13 +204,11 @@ def _stage_rows(directory: Path, rows: list[dict[str, object]]) -> Path:
         raise
 
 
-def _publish_dataset(
+def publish_rows(
     output_dir: Path,
-    audit_rows: list[dict[str, object]],
-    truth_rows: list[dict[str, object]],
+    rows_by_name: dict[str, list[dict[str, object]]],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    rows_by_name = {"audit.jsonl": audit_rows, "truth.jsonl": truth_rows}
     staged: dict[str, Path] = {}
     backups: dict[Path, Path] = {}
     published: set[Path] = set()
@@ -245,6 +243,17 @@ def _publish_dataset(
     finally:
         for path in staged.values():
             path.unlink(missing_ok=True)
+
+
+def _publish_dataset(
+    output_dir: Path,
+    audit_rows: list[dict[str, object]],
+    truth_rows: list[dict[str, object]],
+) -> None:
+    publish_rows(
+        output_dir,
+        {"audit.jsonl": audit_rows, "truth.jsonl": truth_rows},
+    )
 
 
 def build_dataset(
