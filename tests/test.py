@@ -704,6 +704,225 @@ class ProjectEndToEndTest(unittest.TestCase):
             for filename, content in previous.items():
                 self.assertEqual((output / filename).read_bytes(), content)
 
+    def test_phase3_methods_run_on_both_families(self) -> None:
+        expected_methods = {
+            "addis_spending",
+            "always_hold",
+            "fixed_threshold",
+            "greedy",
+            "monitor",
+            "online_closed_e",
+            "oracle",
+            "pace_reset",
+            "reused_holdout",
+            "sgm_transferred",
+            "shrinking_budget",
+        }
+        results: dict[str, list[dict[str, object]]] = {}
+        for world in ("safe", "harmful"):
+            run = self.run_cli(
+                "run-methods",
+                "--data-dir",
+                str(ROOT / "data"),
+                "--world",
+                world,
+                "--seed",
+                "7",
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            rows = [json.loads(line) for line in run.stdout.splitlines()]
+            self.assertEqual(len(rows), 88)
+            self.assertEqual({row["method"] for row in rows}, expected_methods)
+            self.assertEqual(
+                {row["family"] for row in rows},
+                {"authgate_v0", "constraint_plan_v0"},
+            )
+            for method in expected_methods:
+                method_rows = [row for row in rows if row["method"] == method]
+                self.assertEqual(len(method_rows), 8)
+            results[world] = rows
+
+        safe_by_key = {
+            (row["family"], row["update_id"], row["method"]): row
+            for row in results["safe"]
+        }
+        harmful_by_key = {
+            (row["family"], row["update_id"], row["method"]): row
+            for row in results["harmful"]
+        }
+        self.assertEqual(set(safe_by_key), set(harmful_by_key))
+        for key, safe in safe_by_key.items():
+            harmful = harmful_by_key[key]
+            method = key[2]
+            if method not in {"monitor", "oracle"}:
+                self.assertFalse(safe["uses_post_audit"])
+                self.assertNotIn("world", safe)
+                self.assertEqual(safe, harmful)
+            else:
+                self.assertEqual(safe["world"], "safe")
+                self.assertEqual(harmful["world"], "harmful")
+
+        safe_auth_oracle = safe_by_key[("authgate_v0", "candidate", "oracle")]
+        harmful_auth_oracle = harmful_by_key[("authgate_v0", "candidate", "oracle")]
+        self.assertTrue(safe_auth_oracle["deploy"])
+        self.assertFalse(harmful_auth_oracle["deploy"])
+        self.assertTrue(
+            all(
+                not row["deploy"]
+                for row in results["harmful"]
+                if row["method"] == "always_hold"
+            )
+        )
+
+        transferred = harmful_by_key[("constraint_plan_v0", "p6", "sgm_transferred")]
+        reset = harmful_by_key[("constraint_plan_v0", "p6", "pace_reset")]
+        closed = harmful_by_key[("constraint_plan_v0", "p6", "online_closed_e")]
+        self.assertTrue(transferred["deploy"])
+        self.assertFalse(reset["deploy"])
+        self.assertFalse(closed["deploy"])
+        self.assertIn("known-bad", transferred["reason"])
+
+        repeated = self.run_cli(
+            "run-methods",
+            "--data-dir",
+            str(ROOT / "data"),
+            "--world",
+            "safe",
+            "--seed",
+            "7",
+        )
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertEqual(
+            repeated.stdout,
+            "".join(
+                json.dumps(
+                    row, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                )
+                + "\n"
+                for row in results["safe"]
+            ),
+        )
+
+        from src.lifecycle import run_methods
+
+        observed_monitors: list[tuple[str, object]] = []
+
+        class ProbeMethod:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def decide(self, update: object, monitor: object = None) -> object:
+                observed_monitors.append((self.name, monitor))
+                return type(
+                    "ProbeDecision",
+                    (),
+                    {
+                        "deploy": False,
+                        "reason": "probe",
+                        "statistic": 0.0,
+                        "threshold": 0.0,
+                    },
+                )()
+
+        with patch(
+            "src.lifecycle.build_methods",
+            return_value=(ProbeMethod("greedy"), ProbeMethod("monitor")),
+        ):
+            run_methods(ROOT / "data", world="harmful")
+        self.assertTrue(
+            all(
+                monitor is None
+                for name, monitor in observed_monitors
+                if name == "greedy"
+            )
+        )
+        self.assertTrue(
+            all(
+                monitor is not None
+                for name, monitor in observed_monitors
+                if name == "monitor"
+            )
+        )
+
+    def test_phase3_invalid_evidence_does_not_replace_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data"
+            data.mkdir()
+            for name in (
+                "audit.jsonl",
+                "truth.jsonl",
+                "planning_audit.jsonl",
+                "planning_truth.jsonl",
+            ):
+                (data / name).write_bytes((ROOT / "data" / name).read_bytes())
+
+            audit_rows = read_jsonl(data / "audit.jsonl")
+            audit_rows[0]["audit_harm"] = "not-a-fraction"
+            (data / "audit.jsonl").write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in audit_rows),
+                encoding="utf-8",
+            )
+            output = root / "decisions.jsonl"
+            output.write_bytes(b"previous decisions\n")
+            failed = self.run_cli(
+                "run-methods",
+                "--data-dir",
+                str(data),
+                "--world",
+                "harmful",
+                "--output",
+                str(output),
+            )
+            self.assertEqual(failed.returncode, 2)
+            self.assertIn("invalid exact fraction", failed.stderr)
+            self.assertEqual(output.read_bytes(), b"previous decisions\n")
+
+        for mutation in ("missing", "extra"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                data = root / "data"
+                data.mkdir()
+                for name in (
+                    "audit.jsonl",
+                    "truth.jsonl",
+                    "planning_audit.jsonl",
+                    "planning_truth.jsonl",
+                ):
+                    (data / name).write_bytes((ROOT / "data" / name).read_bytes())
+                truth_rows = read_jsonl(data / "planning_truth.jsonl")
+                if mutation == "missing":
+                    truth_rows = [row for row in truth_rows if row["policy_id"] != "p7"]
+                else:
+                    extras = []
+                    for row in truth_rows:
+                        if row["policy_id"] == "p7":
+                            extra = dict(row)
+                            extra["policy_id"] = "p8"
+                            extras.append(extra)
+                    truth_rows.extend(extras)
+                (data / "planning_truth.jsonl").write_text(
+                    "".join(
+                        json.dumps(row, sort_keys=True) + "\n" for row in truth_rows
+                    ),
+                    encoding="utf-8",
+                )
+                failed = self.run_cli(
+                    "run-methods",
+                    "--data-dir",
+                    str(data),
+                    "--world",
+                    "harmful",
+                )
+                self.assertEqual(failed.returncode, 2)
+                self.assertIn(
+                    "planning truth must contain policies p0 through p7",
+                    failed.stderr,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

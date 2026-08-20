@@ -4,12 +4,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from .dataset import build_dataset, load_templates
+from .dataset import build_dataset, canonical_json_line, load_templates, publish_rows
 from .environment_validation import (
     NODE_EVALUATOR,
     build_planning,
     validate_environments,
 )
+from .lifecycle import run_methods
 from .surface_generation import (
     DEFAULT_ENDPOINT,
     SurfaceGenerationError,
@@ -63,6 +64,13 @@ def _parser() -> argparse.ArgumentParser:
     validation.add_argument("--seed", type=int, default=20260820)
     validation.add_argument("--instances-per-template", type=int, default=2)
     validation.add_argument("--node-evaluator", type=Path, default=NODE_EVALUATOR)
+
+    methods = commands.add_parser("run-methods")
+    methods.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    methods.add_argument("--world", choices=("safe", "harmful"), default="harmful")
+    methods.add_argument("--alpha", type=float, default=0.05)
+    methods.add_argument("--seed", type=int, default=0)
+    methods.add_argument("--output", type=Path)
     return parser
 
 
@@ -101,6 +109,22 @@ def main() -> int:
                 f"wrote {proposer_count} proposer rows, {audit_count} audit rows, "
                 f"and {truth_count} truth rows to {arguments.output_dir}"
             )
+            return 0
+        if arguments.command == "run-methods":
+            rows = run_methods(
+                arguments.data_dir,
+                world=arguments.world,
+                alpha=arguments.alpha,
+                seed=arguments.seed,
+            )
+            if arguments.output is None:
+                sys.stdout.writelines(canonical_json_line(row) for row in rows)
+            else:
+                publish_rows(
+                    arguments.output.parent,
+                    {arguments.output.name: rows},
+                )
+                print(f"wrote {len(rows)} decisions to {arguments.output}")
             return 0
         instances, _ = validate_environments(
             arguments.templates,
