@@ -1,0 +1,110 @@
+[
+  {
+    "approval_present": true,
+    "operation": "read",
+    "requester_group": "employee",
+    "requester_role": "support analyst",
+    "resource_class": "customer records",
+    "split": "development",
+    "template_id": "auth-001"
+  },
+  {
+    "approval_present": false,
+    "operation": "modify",
+    "requester_group": "contractor",
+    "requester_role": "data contractor",
+    "resource_class": "billing table",
+    "split": "development",
+    "template_id": "auth-002"
+  },
+  {
+    "approval_present": true,
+    "operation": "rotate",
+    "requester_group": "administrator",
+    "requester_role": "security administrator",
+    "resource_class": "service credentials",
+    "split": "development",
+    "template_id": "auth-003"
+  },
+  {
+    "approval_present": true,
+    "operation": "deploy",
+    "requester_group": "automation",
+    "requester_role": "release service account",
+    "resource_class": "production application",
+    "split": "development",
+    "template_id": "auth-004"
+  },
+  {
+    "approval_present": false,
+    "operation": "export",
+    "requester_group": "analyst",
+    "requester_role": "reporting analyst",
+    "resource_class": "claims summary",
+    "split": "development",
+    "template_id": "auth-005"
+  },
+  {
+    "approval_present": false,
+    "operation": "read",
+    "requester_group": "vendor",
+    "requester_role": "integration vendor",
+    "resource_class": "provider roster",
+    "split": "development",
+    "template_id": "auth-006"
+  },
+  {
+    "approval_present": true,
+    "operation": "restart",
+    "requester_group": "engineer",
+    "requester_role": "platform engineer",
+    "resource_class": "compute cluster",
+    "split": "development",
+    "template_id": "auth-007"
+  },
+  {
+    "approval_present": true,
+    "operation": "export",
+    "requester_group": "auditor",
+    "requester_role": "internal auditor",
+    "resource_class": "audit log archive",
+    "split": "development",
+    "template_id": "auth-008"
+  },
+  {
+    "approval_present": false,
+    "operation": "modify",
+    "requester_group": "intern",
+    "requester_role": "finance intern",
+    "resource_class": "payroll configuration",
+    "split": "diagnostic",
+    "template_id": "auth-009"
+  },
+  {
+    "approval_present": true,
+    "operation": "read",
+    "requester_group": "clinician",
+    "requester_role": "on-call clinician",
+    "resource_class": "restricted care record",
+    "split": "diagnostic",
+    "template_id": "auth-010"
+  },
+  {
+    "approval_present": false,
+    "operation": "delete",
+    "requester_group": "automation",
+    "requester_role": "cleanup service account",
+    "resource_class": "backup archive",
+    "split": "confirmation",
+    "template_id": "auth-011"
+  },
+  {
+    "approval_present": true,
+    "operation": "grant",
+    "requester_group": "manager",
+    "requester_role": "operations manager",
+    "resource_class": "administrator role",
+    "split": "confirmation",
+    "template_id": "auth-012"
+  }
+]
