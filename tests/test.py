@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
 
-from post_audit_mirage.authgate import (
+from src.authgate import (
     HORIZON,
     Action,
     Case,
@@ -24,14 +24,14 @@ from post_audit_mirage.authgate import (
     enumerate_paths,
     reachable_states,
 )
-from post_audit_mirage.dataset import build_dataset, canonical_json_bytes
-from post_audit_mirage.surface_generation import MODEL, RETURNED_MODELS
+from src.dataset import build_dataset, canonical_json_bytes
+from src.surface_generation import MODEL, RETURNED_MODELS
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATES = ROOT / "data" / "authgate_v0" / "templates.json"
-SURFACES = ROOT / "data" / "authgate_v0" / "surface_variants.jsonl"
-AUDIT = ROOT / "data" / "authgate_v0" / "audit.jsonl"
-TRUTH = ROOT / "data" / "authgate_v0" / "truth.jsonl"
+TEMPLATES = ROOT / "data" / "templates.json"
+SURFACES = ROOT / "data" / "surface_variants.jsonl"
+AUDIT = ROOT / "data" / "audit.jsonl"
+TRUTH = ROOT / "data" / "truth.jsonl"
 
 
 def _handler(invalid_model: bool) -> type[BaseHTTPRequestHandler]:
@@ -112,7 +112,7 @@ class ProjectEndToEndTest(unittest.TestCase):
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, "-m", "post_audit_mirage", *arguments],
+            [sys.executable, "-m", "src", *arguments],
             cwd=ROOT,
             env=env,
             capture_output=True,
@@ -461,7 +461,7 @@ class ProjectEndToEndTest(unittest.TestCase):
 
             with (
                 patch(
-                    "post_audit_mirage.dataset.os.replace",
+                    "src.dataset.os.replace",
                     side_effect=fail_truth_once,
                 ),
                 self.assertRaises(OSError),

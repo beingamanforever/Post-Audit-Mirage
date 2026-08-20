@@ -4,19 +4,19 @@ import argparse
 import sys
 from pathlib import Path
 
-from post_audit_mirage.dataset import build_dataset, load_templates
-from post_audit_mirage.surface_generation import (
+from .dataset import build_dataset, load_templates
+from .surface_generation import (
     DEFAULT_ENDPOINT,
     SurfaceGenerationError,
     generate_surface_file,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "authgate_v0"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="post_audit_mirage")
+    parser = argparse.ArgumentParser(prog="python -m src")
     commands = parser.add_subparsers(dest="command", required=True)
 
     surfaces = commands.add_parser("generate-surfaces")

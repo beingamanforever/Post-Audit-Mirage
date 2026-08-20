@@ -6,14 +6,14 @@ import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from post_audit_mirage.authgate import (
+from .authgate import (
     Case,
     Policy,
     World,
     audit_record,
     truth_record,
 )
-from post_audit_mirage.surface_generation import MODEL, PROMPT_VERSION, RETURNED_MODELS
+from .surface_generation import MODEL, PROMPT_VERSION, RETURNED_MODELS
 
 TEMPLATE_FIELDS = {
     "approval_present",
