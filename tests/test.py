@@ -923,6 +923,224 @@ class ProjectEndToEndTest(unittest.TestCase):
                     failed.stderr,
                 )
 
+    def test_phase4_experiments_prove_landscape_limit_and_restoration(self) -> None:
+        filenames = {
+            "experiment_impossibility.svg",
+            "experiment_landscape.svg",
+            "experiment_restoration.svg",
+            "phase4_results.jsonl",
+            "phase4_summary.json",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            run = self.run_cli("run-experiments", "--output-dir", str(output))
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual({path.name for path in output.iterdir()}, filenames)
+            summary = json.loads(
+                (output / "phase4_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                summary["config"],
+                {
+                    "alpha": 0.05,
+                    "audit_batch": 64,
+                    "lifecycle_length": 50,
+                    "monitor_sizes": [
+                        5,
+                        10,
+                        20,
+                        50,
+                        100,
+                        200,
+                        500,
+                        1000,
+                        2500,
+                        5000,
+                        10000,
+                        20000,
+                    ],
+                    "monitor_truth": {
+                        "authgate_v0": {
+                            "harmful": [0.2, 0.05],
+                            "safe": [0.02, 0.05],
+                        },
+                        "constraint_plan_v0": {
+                            "harmful": [1.0, 0.15],
+                            "safe": [0.0, 0.15],
+                        },
+                    },
+                    "replications": 500,
+                    "seed": 20260821,
+                },
+            )
+            self.assertEqual(
+                {
+                    name: result["status"]
+                    for name, result in summary["experiments"].items()
+                },
+                {
+                    "experiment_2": "passed",
+                    "experiment_3": "passed",
+                    "experiment_4": "passed",
+                },
+            )
+            self.assertTrue(
+                summary["experiments"]["experiment_4"]["criteria"][
+                    "correct_width_lifecycle_harm_upper_at_most_0_05"
+                ]
+            )
+            self.assertEqual(
+                summary["experiments"]["experiment_4"]["first_separation_monitor_n"],
+                {"authgate_v0": 20000, "constraint_plan_v0": 500},
+            )
+
+            rows = read_jsonl(output / "phase4_results.jsonl")
+            self.assertEqual(len(rows), 714)
+            for row in rows:
+                self.assertIn(row["family"], {"authgate_v0", "constraint_plan_v0"})
+                if row["metric"] in {"first_harm_round", "genuine_acceptance"}:
+                    self.assertGreaterEqual(row["trials"], 0)
+                else:
+                    self.assertGreater(row["trials"], 0)
+                self.assertGreaterEqual(row["estimate"], -50)
+                self.assertLessEqual(row["estimate"], 50)
+
+            landscape = [
+                row
+                for row in rows
+                if row["experiment"] == "experiment_2"
+                and row["scenario"] == "mixed"
+                and row["metric"] == "harmful_lifecycle"
+            ]
+            self.assertTrue(
+                all(
+                    row["successes"] == 500
+                    for row in landscape
+                    if row["method"] == "sgm_transferred"
+                )
+            )
+            self.assertTrue(
+                all(
+                    row["ci_upper"] <= 0.05
+                    for row in landscape
+                    if row["method"]
+                    in {"shrinking_budget", "addis_spending", "online_closed_e"}
+                )
+            )
+
+            paired = [
+                row
+                for row in rows
+                if row["experiment"] == "experiment_3"
+                and row["metric"] == "paired_decision_match"
+            ]
+            self.assertEqual(len(paired), 18)
+            self.assertTrue(all(row["successes"] == row["trials"] for row in paired))
+            abstentions = [
+                row
+                for row in rows
+                if row["experiment"] == "experiment_3"
+                and row["metric"] == "cannot_determine"
+            ]
+            self.assertEqual(len(abstentions), 4)
+            self.assertTrue(
+                all(row["successes"] == row["trials"] for row in abstentions)
+            )
+
+            false_safe = [
+                row
+                for row in rows
+                if row["experiment"] == "experiment_4"
+                and row["family"] == "authgate_v0"
+                and row["scenario"] == "harmful"
+                and row["metric"] == "harmful_lifecycle_false_safe"
+            ]
+            by_rule = {row["method"]: row for row in false_safe}
+            self.assertEqual(by_rule["correct_width"]["successes"], 0)
+            self.assertGreater(by_rule["too_narrow"]["ci_lower"], 0.05)
+
+            for filename in filenames:
+                content = (output / filename).read_text(encoding="utf-8")
+                self.assertNotIn("\u2014", content)
+                if filename.endswith(".svg"):
+                    self.assertIn("<title", content)
+                    self.assertIn("<desc", content)
+                    self.assertIn('role="img"', content)
+            restoration_svg = (output / "experiment_restoration.svg").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('stroke-dasharray="7 4"', restoration_svg)
+            self.assertIn('stroke-dasharray="2 4"', restoration_svg)
+            self.assertIn("<rect", restoration_svg)
+            self.assertIn("<polygon", restoration_svg)
+
+        with (
+            tempfile.TemporaryDirectory() as first_directory,
+            tempfile.TemporaryDirectory() as second_directory,
+        ):
+            for directory in (first_directory, second_directory):
+                repeated = self.run_cli(
+                    "run-experiments",
+                    "--output-dir",
+                    directory,
+                    "--replications",
+                    "30",
+                    "--seed",
+                    "19",
+                )
+                self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            for filename in filenames:
+                self.assertEqual(
+                    (Path(first_directory) / filename).read_bytes(),
+                    (Path(second_directory) / filename).read_bytes(),
+                )
+
+    def test_phase4_publication_failure_restores_every_artifact(self) -> None:
+        from src.experiments import run_experiments
+
+        filenames = (
+            "phase4_results.jsonl",
+            "phase4_summary.json",
+            "experiment_landscape.svg",
+            "experiment_impossibility.svg",
+            "experiment_restoration.svg",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            previous = {
+                filename: f"previous {filename}\n".encode() for filename in filenames
+            }
+            for filename, content in previous.items():
+                (output / filename).write_bytes(content)
+            target = output / "experiment_impossibility.svg"
+            real_replace = os.replace
+            failure_injected = False
+
+            def fail_impossibility_once(source: Path, destination: Path) -> None:
+                nonlocal failure_injected
+                if Path(destination) == target and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected Phase 4 publication failure")
+                real_replace(source, destination)
+
+            with (
+                patch(
+                    "src.experiments.os.replace", side_effect=fail_impossibility_once
+                ),
+                self.assertRaises(OSError),
+            ):
+                run_experiments(
+                    output,
+                    data_dir=ROOT / "data",
+                    replications=1,
+                    seed=9,
+                )
+
+            self.assertTrue(failure_injected)
+            self.assertEqual({path.name for path in output.iterdir()}, set(filenames))
+            for filename, content in previous.items():
+                self.assertEqual((output / filename).read_bytes(), content)
+
 
 if __name__ == "__main__":
     unittest.main()

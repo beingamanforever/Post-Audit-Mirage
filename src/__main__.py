@@ -10,6 +10,7 @@ from .environment_validation import (
     build_planning,
     validate_environments,
 )
+from .experiments import run_experiments
 from .lifecycle import run_methods
 from .surface_generation import (
     DEFAULT_ENDPOINT,
@@ -71,6 +72,13 @@ def _parser() -> argparse.ArgumentParser:
     methods.add_argument("--alpha", type=float, default=0.05)
     methods.add_argument("--seed", type=int, default=0)
     methods.add_argument("--output", type=Path)
+
+    experiments = commands.add_parser("run-experiments")
+    experiments.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    experiments.add_argument("--output-dir", type=Path, default=DATA_DIR)
+    experiments.add_argument("--replications", type=int, default=500)
+    experiments.add_argument("--seed", type=int, default=20260821)
+    experiments.add_argument("--alpha", type=float, default=0.05)
     return parser
 
 
@@ -125,6 +133,20 @@ def main() -> int:
                     {arguments.output.name: rows},
                 )
                 print(f"wrote {len(rows)} decisions to {arguments.output}")
+            return 0
+        if arguments.command == "run-experiments":
+            summary = run_experiments(
+                arguments.output_dir,
+                data_dir=arguments.data_dir,
+                replications=arguments.replications,
+                seed=arguments.seed,
+                alpha=arguments.alpha,
+            )
+            statuses = ", ".join(
+                f"{name}={result['status']}"
+                for name, result in summary["experiments"].items()
+            )
+            print(f"wrote Phase 4 results to {arguments.output_dir}: {statuses}")
             return 0
         instances, _ = validate_environments(
             arguments.templates,
