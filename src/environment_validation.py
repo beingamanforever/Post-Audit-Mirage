@@ -15,6 +15,14 @@ from .authgate import (
     generated_evaluator_input,
     truth_record,
 )
+from .batch_triage import (
+    Policy as BatchTriagePolicy,
+    anchor_instance as batch_triage_anchor,
+    audit_record as batch_triage_audit_record,
+    evaluate_all as evaluate_batch_triage,
+    evaluator_input as batch_triage_evaluator_input,
+    generate_batch_triage_instance,
+)
 from .constraint_plan import (
     evaluate_all,
     evaluator_input,
@@ -26,9 +34,14 @@ from .constraint_plan import (
 from .dataset import canonical_json_bytes, publish_rows
 
 NODE_EVALUATOR = Path(__file__).with_name("exact_evaluator.js")
+BATCH_TRIAGE_EVALUATOR = Path(__file__).with_name("batch_triage_evaluator.js")
 AUTHGATE_SEEDS_BY_SPLIT = {
     "development": (11, 29, 47),
     "diagnostic": (0, 11, 22),
+}
+BATCH_TRIAGE_SEEDS_BY_SPLIT = {
+    "development": (0, 1, 2, 3, 6, 9, 18, 36),
+    "diagnostic": (0, 1, 2, 3, 6, 9, 18, 36),
 }
 
 
@@ -135,6 +148,155 @@ def _validate_authgate(node_path: Path) -> None:
                 diagnostic_axes[3].add(tuple(evaluator["groups"][1]["harm_path"]))
     if any(len(values) != 3 for values in diagnostic_axes):
         raise ValueError("generated AuthGate diagnostic parity panel is incomplete")
+
+
+def _batch_triage_rows(
+    instance: dict[str, object], node_path: Path
+) -> list[dict[str, object]]:
+    evaluator = batch_triage_evaluator_input(instance)
+    python_rows = evaluate_batch_triage(evaluator)
+    node_rows = _node(evaluator, node_path)
+    if canonical_json_bytes({"rows": python_rows}) != canonical_json_bytes(
+        {"rows": node_rows}
+    ):
+        raise ValueError(
+            "Python and Node BatchTriage evaluators disagree for "
+            f"{instance['instance_id']}"
+        )
+    for policy in BatchTriagePolicy:
+        safe = _result(python_rows, policy.value, "safe")
+        harmful = _result(python_rows, policy.value, "harmful")
+        if canonical_json_bytes(safe["audit"]) != canonical_json_bytes(
+            harmful["audit"]
+        ):
+            raise ValueError(
+                f"BatchTriage audits differ for {instance['instance_id']} "
+                f"policy {policy.value}"
+            )
+        if batch_triage_audit_record(instance, policy) != {
+            "audit": safe["audit"],
+            "policy_id": policy.value,
+        }:
+            raise ValueError(
+                f"BatchTriage audit projection is wrong for {instance['instance_id']}"
+            )
+    return python_rows
+
+
+def _validate_batch_triage_anchor(node_path: Path) -> None:
+    rows = _batch_triage_rows(batch_triage_anchor(), node_path)
+    candidate_harmful = _result(rows, "candidate", "harmful")
+    candidate_safe = _result(rows, "candidate", "safe")
+    incumbent_harmful = _result(rows, "incumbent", "harmful")
+    expected_harmful = {
+        "backlog_probability": "1/20",
+        "completed_per_batch": "11/20",
+        "first_harm_time": 2,
+        "group_harm": {"common": "0/1", "rare": "1/2"},
+        "overall_harm": "1/22",
+        "unconditional_harm": "1/40",
+    }
+    if any(
+        candidate_harmful[field] != expected
+        for field, expected in expected_harmful.items()
+    ):
+        raise ValueError("BatchTriage harmful anchor is wrong")
+    if not (
+        candidate_safe["backlog_probability"] == "0/1"
+        and candidate_safe["completed_per_batch"] == "11/20"
+        and candidate_safe["first_harm_time"] is None
+        and candidate_safe["group_harm"] == {"common": "0/1", "rare": "0/1"}
+        and candidate_safe["overall_harm"] == "0/1"
+        and candidate_safe["unconditional_harm"] == "0/1"
+    ):
+        raise ValueError("BatchTriage safe anchor is wrong")
+    if not (
+        incumbent_harmful["backlog_probability"] == "1/20"
+        and incumbent_harmful["completed_per_batch"] == "11/20"
+        and incumbent_harmful["first_harm_time"] is None
+        and incumbent_harmful["group_harm"] == {"common": "0/1", "rare": "0/1"}
+        and incumbent_harmful["overall_harm"] == "0/1"
+        and incumbent_harmful["unconditional_harm"] == "0/1"
+    ):
+        raise ValueError("BatchTriage earliest-deadline anchor is wrong")
+
+
+def _validate_batch_triage_probes(node_path: Path) -> None:
+    evaluator = batch_triage_evaluator_input(batch_triage_anchor())
+    malformed: list[tuple[str, dict[str, object]]] = []
+
+    invalid_probability = copy.deepcopy(evaluator)
+    invalid_probability["worlds"]["safe"][0]["probability"] = "0.5"
+    malformed.append(("malformed probability", invalid_probability))
+
+    noncanonical_probability = copy.deepcopy(evaluator)
+    noncanonical_probability["worlds"]["safe"][0]["probability"] = "2/4"
+    malformed.append(("noncanonical probability", noncanonical_probability))
+
+    non_normalized = copy.deepcopy(evaluator)
+    non_normalized["worlds"]["safe"][0]["probability"] = "1/3"
+    malformed.append(("non-normalized support", non_normalized))
+
+    short_horizon = copy.deepcopy(evaluator)
+    short_horizon["horizon"] = 2
+    malformed.append(("short horizon", short_horizon))
+
+    unknown_policy = copy.deepcopy(evaluator)
+    unknown_policy["policies"][0]["priority"] = "unknown"
+    malformed.append(("unknown policy", unknown_policy))
+
+    zero_service_cost = copy.deepcopy(evaluator)
+    zero_service_cost["policies"][0]["service_cost"] = "0/1"
+    malformed.append(("zero service cost", zero_service_cost))
+
+    for name, candidate in malformed:
+        try:
+            evaluate_batch_triage(candidate)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"Python accepted malformed BatchTriage input: {name}")
+        try:
+            _node(candidate, node_path)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"Node accepted malformed BatchTriage input: {name}")
+
+
+def _validate_batch_triage(node_path: Path) -> None:
+    _validate_batch_triage_anchor(node_path)
+    axes = {
+        "candidate_cost": set(),
+        "candidate_priority": set(),
+        "common_deadline": set(),
+        "common_probability": set(),
+        "harm_delay": set(),
+        "rare_probability": set(),
+    }
+    for split, seeds in BATCH_TRIAGE_SEEDS_BY_SPLIT.items():
+        for seed in seeds:
+            instance = generate_batch_triage_instance(split, seed)
+            _batch_triage_rows(instance, node_path)
+            groups = {group["group_id"]: group for group in instance["groups"]}
+            policies = {policy["policy_id"]: policy for policy in instance["policies"]}
+            axes["candidate_cost"].add(policies["candidate"]["service_cost"])
+            axes["candidate_priority"].add(policies["candidate"]["priority"])
+            axes["common_deadline"].add(groups["common"]["deadline"])
+            axes["common_probability"].add(groups["common"]["arrival_probability"])
+            axes["harm_delay"].add(instance["harm_delay"])
+            axes["rare_probability"].add(groups["rare"]["arrival_probability"])
+    expected_axis_sizes = {
+        "candidate_cost": 4,
+        "candidate_priority": 2,
+        "common_deadline": 3,
+        "common_probability": 6,
+        "harm_delay": 3,
+        "rare_probability": 6,
+    }
+    if any(len(axes[name]) != size for name, size in expected_axis_sizes.items()):
+        raise ValueError("BatchTriage semantic parity panel is incomplete")
+    _validate_batch_triage_probes(node_path)
 
 
 def _result(
@@ -324,8 +486,10 @@ def validate_environments(
     seed: int,
     instances_per_template: int = 2,
     node_path: Path = NODE_EVALUATOR,
+    batch_triage_path: Path = BATCH_TRIAGE_EVALUATOR,
 ) -> tuple[list[dict[str, object]], dict[str, list[dict[str, object]]]]:
     _validate_authgate(node_path)
+    _validate_batch_triage(batch_triage_path)
     instances = generate_instances(
         load_templates(templates_path),
         seed=seed,
@@ -407,12 +571,14 @@ def build_planning(
     seed: int,
     instances_per_template: int = 2,
     node_path: Path = NODE_EVALUATOR,
+    batch_triage_path: Path = BATCH_TRIAGE_EVALUATOR,
 ) -> tuple[int, int, int]:
     instances, results_by_instance = validate_environments(
         templates_path,
         seed=seed,
         instances_per_template=instances_per_template,
         node_path=node_path,
+        batch_triage_path=batch_triage_path,
     )
     proposer_rows: list[dict[str, object]] = []
     audit_rows: list[dict[str, object]] = []

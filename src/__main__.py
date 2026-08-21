@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .dataset import build_dataset, canonical_json_line, load_templates, publish_rows
 from .environment_validation import (
+    BATCH_TRIAGE_EVALUATOR,
     NODE_EVALUATOR,
     build_planning,
     validate_environments,
@@ -56,6 +57,11 @@ def _parser() -> argparse.ArgumentParser:
     planning.add_argument("--seed", type=int, default=20260820)
     planning.add_argument("--instances-per-template", type=int, default=2)
     planning.add_argument("--node-evaluator", type=Path, default=NODE_EVALUATOR)
+    planning.add_argument(
+        "--batch-triage-evaluator",
+        type=Path,
+        default=BATCH_TRIAGE_EVALUATOR,
+    )
 
     validation = commands.add_parser("validate-environments")
     validation.add_argument(
@@ -66,6 +72,11 @@ def _parser() -> argparse.ArgumentParser:
     validation.add_argument("--seed", type=int, default=20260820)
     validation.add_argument("--instances-per-template", type=int, default=2)
     validation.add_argument("--node-evaluator", type=Path, default=NODE_EVALUATOR)
+    validation.add_argument(
+        "--batch-triage-evaluator",
+        type=Path,
+        default=BATCH_TRIAGE_EVALUATOR,
+    )
 
     methods = commands.add_parser("run-methods")
     methods.add_argument("--data-dir", type=Path, default=DATA_DIR)
@@ -114,6 +125,7 @@ def main() -> int:
                 seed=arguments.seed,
                 instances_per_template=arguments.instances_per_template,
                 node_path=arguments.node_evaluator,
+                batch_triage_path=arguments.batch_triage_evaluator,
             )
             print(
                 f"wrote {proposer_count} proposer rows, {audit_count} audit rows, "
@@ -159,8 +171,12 @@ def main() -> int:
             seed=arguments.seed,
             instances_per_template=arguments.instances_per_template,
             node_path=arguments.node_evaluator,
+            batch_triage_path=arguments.batch_triage_evaluator,
         )
-        print(f"validated both exact evaluators on {len(instances)} planning instances")
+        print(
+            f"validated all three exact evaluators on {len(instances)} "
+            "planning instances"
+        )
         return 0
     except (OSError, ValueError, SurfaceGenerationError) as error:
         print(f"error: {error}", file=sys.stderr)

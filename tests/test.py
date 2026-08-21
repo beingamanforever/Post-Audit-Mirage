@@ -11,6 +11,7 @@ import threading
 import unittest
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import asdict
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import permutations
@@ -35,6 +36,15 @@ from src.authgate import (
     generated_truth_record,
     reachable_states,
 )
+from src.batch_triage import (
+    BATCH_TRIAGE_FAMILY,
+    Policy as BatchTriagePolicy,
+    anchor_instance as batch_triage_anchor,
+    audit_record as batch_triage_audit_record,
+    evaluate_all as evaluate_batch_triage,
+    evaluator_input as batch_triage_evaluator_input,
+    generate_batch_triage_instance,
+)
 from src.constraint_plan import (
     MAX_ASSIGNMENTS,
     evaluate_all,
@@ -54,6 +64,7 @@ from src.decision_methods import (
     PaceReset,
     SgmTransferred,
     UpdateEvidence,
+    build_public_methods,
 )
 from src.environment_validation import build_planning
 from src.environment_lifecycles import realize_lifecycle, realize_matched_pair
@@ -70,6 +81,7 @@ PLANNING_PROPOSER = ROOT / "data" / "planning_proposer.jsonl"
 PLANNING_AUDIT = ROOT / "data" / "planning_audit.jsonl"
 PLANNING_TRUTH = ROOT / "data" / "planning_truth.jsonl"
 NODE_EVALUATOR = ROOT / "src" / "exact_evaluator.js"
+BATCH_TRIAGE_EVALUATOR = ROOT / "src" / "batch_triage_evaluator.js"
 
 
 def _handler(invalid_model: bool) -> type[BaseHTTPRequestHandler]:
@@ -1420,6 +1432,302 @@ class ProjectEndToEndTest(unittest.TestCase):
                     canonical_json_bytes({"rows": json.loads(node.stdout)["results"]}),
                 )
 
+    def test_batch_triage_exact_environment_end_to_end(self) -> None:
+        anchor = batch_triage_anchor()
+        evaluator = batch_triage_evaluator_input(anchor)
+        rows = evaluate_batch_triage(evaluator)
+
+        def result(
+            evaluated: list[dict[str, object]], policy_id: str, world: str
+        ) -> dict[str, object]:
+            return next(
+                row
+                for row in evaluated
+                if row["policy_id"] == policy_id and row["world"] == world
+            )
+
+        candidate_safe = result(rows, "candidate", "safe")
+        candidate_harmful = result(rows, "candidate", "harmful")
+        incumbent_harmful = result(rows, "incumbent", "harmful")
+        self.assertEqual(
+            {
+                key: candidate_harmful[key]
+                for key in (
+                    "backlog_probability",
+                    "completed_per_batch",
+                    "first_harm_time",
+                    "group_harm",
+                    "overall_harm",
+                    "unconditional_harm",
+                )
+            },
+            {
+                "backlog_probability": "1/20",
+                "completed_per_batch": "11/20",
+                "first_harm_time": 2,
+                "group_harm": {"common": "0/1", "rare": "1/2"},
+                "overall_harm": "1/22",
+                "unconditional_harm": "1/40",
+            },
+        )
+        self.assertEqual(candidate_safe["overall_harm"], "0/1")
+        self.assertEqual(candidate_safe["completed_per_batch"], "11/20")
+        self.assertEqual(candidate_safe["first_harm_time"], None)
+        self.assertEqual(incumbent_harmful["overall_harm"], "0/1")
+        self.assertEqual(incumbent_harmful["completed_per_batch"], "11/20")
+        self.assertEqual(candidate_safe["audit"], candidate_harmful["audit"])
+        self.assertEqual(
+            batch_triage_audit_record(anchor, BatchTriagePolicy.CANDIDATE),
+            {"audit": candidate_safe["audit"], "policy_id": "candidate"},
+        )
+        encoded_audit = json.dumps(
+            batch_triage_audit_record(anchor, BatchTriagePolicy.CANDIDATE),
+            sort_keys=True,
+        )
+        for forbidden in (
+            "backlog_probability",
+            "first_harm_time",
+            "group_harm",
+            "harmful",
+            "safe",
+            "worlds",
+        ):
+            self.assertNotIn(forbidden, encoded_audit)
+
+        safe_support = {
+            (row["common"], row["rare"]): row["probability"]
+            for row in evaluator["worlds"]["safe"]
+        }
+        harmful_support = {
+            (row["common"], row["rare"]): row["probability"]
+            for row in evaluator["worlds"]["harmful"]
+        }
+        self.assertNotEqual(safe_support, harmful_support)
+        for group_id in ("common", "rare"):
+            group_index = 0 if group_id == "common" else 1
+            safe_marginal = sum(
+                Fraction(probability)
+                for outcome, probability in safe_support.items()
+                if outcome[group_index]
+            )
+            harmful_marginal = sum(
+                Fraction(probability)
+                for outcome, probability in harmful_support.items()
+                if outcome[group_index]
+            )
+            self.assertEqual(safe_marginal, harmful_marginal)
+
+        for split in ("development", "diagnostic"):
+            exact_shapes = set()
+            for seed in range(40):
+                instance = generate_batch_triage_instance(split, seed)
+                request = batch_triage_evaluator_input(instance)
+                python_rows = evaluate_batch_triage(request)
+                node = subprocess.run(
+                    ["node", str(BATCH_TRIAGE_EVALUATOR)],
+                    input=json.dumps(request),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(node.returncode, 0, node.stderr)
+                self.assertEqual(python_rows, json.loads(node.stdout)["results"])
+                exact_shapes.add(canonical_json_bytes({"rows": python_rows}))
+            self.assertEqual(len(exact_shapes), 40)
+
+        development = generate_batch_triage_instance("development", 0)
+        diagnostic = generate_batch_triage_instance("diagnostic", 0)
+        self.assertNotEqual(
+            batch_triage_evaluator_input(development),
+            batch_triage_evaluator_input(diagnostic),
+        )
+        self.assertEqual(
+            {
+                next(
+                    policy["priority"]
+                    for policy in instance["policies"]
+                    if policy["policy_id"] == "candidate"
+                )
+                for instance in (development, diagnostic)
+            },
+            {"common_first", "random"},
+        )
+        self.assertTrue(
+            {
+                group["arrival_probability"] for group in development["groups"]
+            }.isdisjoint(group["arrival_probability"] for group in diagnostic["groups"])
+        )
+
+        ablations = {}
+        capacity_two = copy.deepcopy(evaluator)
+        capacity_two["capacity"] = 2
+        ablations["capacity"] = capacity_two
+        safe_dependence = copy.deepcopy(evaluator)
+        safe_dependence["worlds"]["harmful"] = copy.deepcopy(
+            safe_dependence["worlds"]["safe"]
+        )
+        ablations["dependence"] = safe_dependence
+        equal_deadlines = copy.deepcopy(evaluator)
+        rare = next(
+            group for group in equal_deadlines["groups"] if group["group_id"] == "rare"
+        )
+        common = next(
+            group
+            for group in equal_deadlines["groups"]
+            if group["group_id"] == "common"
+        )
+        rare["deadline"] = common["deadline"]
+        ablations["deadline"] = equal_deadlines
+        earliest_deadline = copy.deepcopy(evaluator)
+        candidate = next(
+            policy
+            for policy in earliest_deadline["policies"]
+            if policy["policy_id"] == "candidate"
+        )
+        candidate["priority"] = "earliest_deadline"
+        ablations["priority"] = earliest_deadline
+        for name, request in ablations.items():
+            with self.subTest(ablation=name):
+                ablated = result(evaluate_batch_triage(request), "candidate", "harmful")
+                self.assertEqual(ablated["overall_harm"], "0/1")
+                self.assertEqual(ablated["group_harm"]["rare"], "0/1")
+                self.assertEqual(ablated["completed_per_batch"], "11/20")
+
+        interaction_cases = 0
+        for capacity in (1, 2):
+            for common_deadline in (1, 2, 3, 4):
+                for rare_deadline in range(1, common_deadline + 1):
+                    for harm_delay in (1, 2, 3):
+                        for priority in (
+                            "common_first",
+                            "earliest_deadline",
+                            "random",
+                        ):
+                            request = copy.deepcopy(evaluator)
+                            request["capacity"] = capacity
+                            request["harm_delay"] = harm_delay
+                            request["horizon"] = common_deadline + harm_delay
+                            for group in request["groups"]:
+                                group["deadline"] = (
+                                    common_deadline
+                                    if group["group_id"] == "common"
+                                    else rare_deadline
+                                )
+                            candidate = next(
+                                policy
+                                for policy in request["policies"]
+                                if policy["policy_id"] == "candidate"
+                            )
+                            candidate["priority"] = priority
+                            python_rows = evaluate_batch_triage(request)
+                            node = subprocess.run(
+                                ["node", str(BATCH_TRIAGE_EVALUATOR)],
+                                input=json.dumps(request),
+                                capture_output=True,
+                                text=True,
+                                check=False,
+                            )
+                            self.assertEqual(node.returncode, 0, node.stderr)
+                            self.assertEqual(
+                                python_rows,
+                                json.loads(node.stdout)["results"],
+                            )
+                            if (
+                                capacity,
+                                common_deadline,
+                                rare_deadline,
+                                harm_delay,
+                                priority,
+                            ) == (1, 1, 1, 1, "earliest_deadline"):
+                                self.assertEqual(
+                                    result(python_rows, "candidate", "harmful")[
+                                        "group_harm"
+                                    ],
+                                    {"common": "1/20", "rare": "1/2"},
+                                )
+                            interaction_cases += 1
+        self.assertEqual(interaction_cases, 180)
+
+        source = BATCH_TRIAGE_EVALUATOR.read_text(encoding="utf-8")
+        mutations = {
+            "transition": (
+                "if (tick < deadline || harmed[groupId] > 0) continue;",
+                "if (tick <= deadline || harmed[groupId] > 0) continue;",
+            ),
+            "parser": (
+                "if (fractionText(result) !== value) {",
+                "if (false && fractionText(result) !== value) {",
+            ),
+            "delayed_accounting": (
+                "const harmTime = deadline + harmDelay;",
+                "const harmTime = deadline;",
+            ),
+            "group_denominator": (
+                "divide(evaluation.harmed[groupId], parsed.groups.get(groupId).arrivalProbability)",
+                "divide(evaluation.harmed[groupId], totalArrivals)",
+            ),
+        }
+        for name, (before, after) in mutations.items():
+            with (
+                self.subTest(mutation=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                self.assertEqual(source.count(before), 1)
+                mutated = Path(directory) / "batch_triage_evaluator.js"
+                mutated.write_text(source.replace(before, after), encoding="utf-8")
+                validated = self.run_cli(
+                    "validate-environments",
+                    "--templates",
+                    str(PLANNING_TEMPLATES),
+                    "--batch-triage-evaluator",
+                    str(mutated),
+                )
+                self.assertEqual(validated.returncode, 2)
+
+        for scenario, expected_safe in (
+            ("null_only", 0),
+            ("all_good", 50),
+            ("mixed", 15),
+        ):
+            lifecycle = realize_lifecycle(BATCH_TRIAGE_FAMILY, scenario, 0)
+            self.assertEqual(
+                sum(item.safe_to_deploy for item in lifecycle.protected_truth),
+                expected_safe,
+            )
+
+        pair = realize_matched_pair(BATCH_TRIAGE_FAMILY, 0)
+        self.assertIs(pair.safe.public_rounds, pair.harmful.public_rounds)
+        public_text = json.dumps(
+            [asdict(item) for item in pair.safe.public_rounds], sort_keys=True
+        )
+        for forbidden in (
+            "backlog_probability",
+            "first_harm_time",
+            "group_harm",
+            "harmful",
+            "safe_to_deploy",
+            "world",
+        ):
+            self.assertNotIn(forbidden, public_text)
+        safe_methods = build_public_methods(seed=17)
+        harmful_methods = build_public_methods(seed=17)
+        safe_decisions = []
+        harmful_decisions = []
+        for public_round in pair.safe.public_rounds:
+            safe_decisions.append(
+                tuple(method.decide(public_round.update) for method in safe_methods)
+            )
+            harmful_decisions.append(
+                tuple(method.decide(public_round.update) for method in harmful_methods)
+            )
+        self.assertEqual(safe_decisions, harmful_decisions)
+        first_harmful = {
+            metric.name: metric.value
+            for metric in pair.harmful.protected_truth[0].metrics
+        }
+        self.assertEqual(first_harmful["overall_harm"], Fraction(1, 22))
+        self.assertEqual(first_harmful["worst_group_harm"], Fraction(1, 2))
+
     def test_invalid_provenance_does_not_replace_dataset(self) -> None:
         mutations = {
             "organization": "",
@@ -2036,7 +2344,7 @@ class ProjectEndToEndTest(unittest.TestCase):
     def test_environment_lifecycles_are_paired_deterministic_and_truth_isolated(
         self,
     ) -> None:
-        for family in ("authgate_v0", "constraint_plan_v0"):
+        for family in ("authgate_v0", "constraint_plan_v0", BATCH_TRIAGE_FAMILY):
             first = realize_lifecycle(family, "mixed", 31)
             repeated = realize_lifecycle(family, "mixed", 31)
             self.assertEqual(first, repeated)

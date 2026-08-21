@@ -12,6 +12,13 @@ from .authgate import (
     generated_audit_record,
     generated_truth_record,
 )
+from .batch_triage import (
+    BATCH_TRIAGE_FAMILY,
+    Policy as BatchPolicy,
+    evaluate_all as evaluate_batch_triage,
+    evaluator_input as batch_triage_evaluator_input,
+    generate_batch_triage_instance,
+)
 from .constraint_plan import (
     evaluate_all,
     evaluator_input,
@@ -29,7 +36,7 @@ from .lifecycle import (
 
 LIFECYCLE_LENGTH = 50
 SCENARIOS = ("null_only", "all_good", "mixed")
-FAMILIES = (AUTH_FAMILY, PLAN_FAMILY)
+FAMILIES = (AUTH_FAMILY, PLAN_FAMILY, BATCH_TRIAGE_FAMILY)
 _PLANNING_TEMPLATES = (
     Path(__file__).resolve().parents[1] / "data" / "planning_templates.json"
 )
@@ -100,7 +107,9 @@ def realize_lifecycle(
 ) -> RealizedLifecycle:
     """Realize one deterministic 50-update exact-environment lifecycle."""
     _validate_inputs(family, scenario, seed)
-    template_text = planning_templates.read_text(encoding="utf-8")
+    template_text = (
+        planning_templates.read_text(encoding="utf-8") if family == PLAN_FAMILY else ""
+    )
     rounds = _build_rounds(
         family,
         scenario,
@@ -136,7 +145,9 @@ def realize_matched_pair(
 ) -> MatchedLifecyclePair:
     """Realize audit-identical safe and harmful lifecycles for Experiment 3."""
     _validate_inputs(family, "all_good", seed)
-    template_text = planning_templates.read_text(encoding="utf-8")
+    template_text = (
+        planning_templates.read_text(encoding="utf-8") if family == PLAN_FAMILY else ""
+    )
     rounds = _build_rounds(
         family,
         "matched",
@@ -189,7 +200,12 @@ def _build_rounds(
     planning_templates: str,
     template_text: str,
 ) -> tuple[_BuiltRound, ...]:
-    builder = _authgate_round if family == AUTH_FAMILY else _planning_round
+    builders = {
+        AUTH_FAMILY: _authgate_round,
+        BATCH_TRIAGE_FAMILY: _batch_triage_round,
+        PLAN_FAMILY: _planning_round,
+    }
+    builder = builders[family]
     return tuple(
         builder(scenario, seed, index, planning_templates, template_text)
         for index in range(LIFECYCLE_LENGTH)
@@ -356,6 +372,134 @@ def _authgate_truth(
             ExactMetric("task_quality", sum(quality) / len(quality)),
             ExactMetric("worst_group_harm", max(group_harm)),
         ),
+        tuple(modes),
+    )
+
+
+@lru_cache(maxsize=32)
+def _batch_triage_bank(
+    seed: int,
+) -> tuple[tuple[dict[str, object], list[dict[str, object]]], ...]:
+    bank = []
+    for index in range(LIFECYCLE_LENGTH):
+        split = "diagnostic" if index >= 40 else "development"
+        generation_seed = _bounded_seed(seed, index, 211)
+        instance = generate_batch_triage_instance(split, generation_seed)
+        rows = evaluate_batch_triage(batch_triage_evaluator_input(instance))
+        bank.append((instance, rows))
+    return tuple(bank)
+
+
+def _batch_triage_round(
+    _scenario: str,
+    seed: int,
+    index: int,
+    _planning_templates: str,
+    _template_text: str,
+) -> _BuiltRound:
+    instance, rows = _batch_triage_bank(seed)[index]
+    candidate = _result(rows, BatchPolicy.CANDIDATE.value, "safe")
+    incumbent = _result(rows, BatchPolicy.INCUMBENT.value, "safe")
+    candidate_audit = dict(candidate["audit"])
+    incumbent_audit = dict(incumbent["audit"])
+    candidate_completion = Fraction(str(candidate_audit["completion_rate"]))
+    incumbent_completion = Fraction(str(incumbent_audit["completion_rate"]))
+    candidate_cost = Fraction(str(candidate_audit["service_cost"]))
+    incumbent_cost = Fraction(str(incumbent_audit["service_cost"]))
+    completion_noninferior = candidate_completion >= incumbent_completion
+    cost_improvement = (incumbent_cost - candidate_cost) / incumbent_cost
+    update = UpdateEvidence(
+        BATCH_TRIAGE_FAMILY,
+        f"batch-{seed}-{index}",
+        (
+            _component(
+                "completion",
+                [1.0 if completion_noninferior else -1.0],
+                require_all=True,
+            ),
+            _component("service_cost", [float(cost_improvement)]),
+        ),
+        (int(completion_noninferior and cost_improvement > 0),),
+    )
+    modes = ["correlated_updates"]
+    if index % 5:
+        modes.extend(("repeated_similar_updates", "partial_evidence_transfer"))
+    public = PublicUpdateRound(
+        index,
+        (str(instance["instance_id"]),),
+        BatchPolicy.CANDIDATE.value,
+        update,
+        tuple(modes),
+    )
+    safe = _result(rows, BatchPolicy.CANDIDATE.value, "safe")
+    harmful = _result(rows, BatchPolicy.CANDIDATE.value, "harmful")
+    safe_incumbent = _result(rows, BatchPolicy.INCUMBENT.value, "safe")
+    harmful_incumbent = _result(rows, BatchPolicy.INCUMBENT.value, "harmful")
+    return _BuiltRound(
+        public,
+        _batch_triage_truth(update, safe, safe_incumbent),
+        _batch_triage_truth(update, harmful, harmful_incumbent),
+    )
+
+
+def _batch_triage_truth(
+    update: UpdateEvidence,
+    row: dict[str, object],
+    incumbent: dict[str, object],
+) -> ProtectedRoundTruth:
+    overall_harm = Fraction(str(row["overall_harm"]))
+    group_harm = [Fraction(str(value)) for value in dict(row["group_harm"]).values()]
+    worst_group_harm = max(group_harm)
+    backlog_probability = Fraction(str(row["backlog_probability"]))
+    completed = Fraction(str(row["completed_per_batch"]))
+    incumbent_completed = Fraction(str(incumbent["completed_per_batch"]))
+    completion_noninferior = completed >= incumbent_completed
+    safe = (
+        overall_harm <= HARM_TOLERANCE
+        and worst_group_harm <= WORST_GROUP_LIMIT
+        and completion_noninferior
+    )
+    monitor = MonitorEvidence(
+        update.family,
+        update.update_id,
+        (
+            ComponentEvidence(
+                "overall_harm",
+                (1.0 if overall_harm <= HARM_TOLERANCE else -1.0,),
+                require_all=True,
+            ),
+            ComponentEvidence(
+                "worst_group",
+                (1.0 if worst_group_harm <= WORST_GROUP_LIMIT else -1.0,),
+                require_all=True,
+            ),
+            ComponentEvidence(
+                "completion",
+                (1.0 if completion_noninferior else -1.0,),
+                require_all=True,
+            ),
+        ),
+    )
+    metrics = [
+        ExactMetric("overall_harm", overall_harm),
+        ExactMetric("worst_group_harm", worst_group_harm),
+        ExactMetric("backlog_probability", backlog_probability),
+        ExactMetric("completed_per_batch", completed),
+    ]
+    first_harm_time = row["first_harm_time"]
+    modes = []
+    if first_harm_time is not None:
+        metrics.append(ExactMetric("first_harm_time", Fraction(first_harm_time)))
+        modes.append("delayed_harm")
+    if max(group_harm) > min(group_harm):
+        modes.append("group_dependent_drift")
+    if backlog_probability > 0:
+        modes.append("shared_capacity_interference")
+    return ProtectedRoundTruth(
+        str(row["world"]),
+        safe,
+        monitor,
+        tuple(metrics),
         tuple(modes),
     )
 
