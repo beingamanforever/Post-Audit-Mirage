@@ -150,6 +150,244 @@ function authgateResults() {
   return results;
 }
 
+const GENERATED_SAFE_PATHS = [
+  ["ordinary_followup", "access_expired", "safe_terminal"],
+  ["ordinary_followup", "delayed_check", "task_success", "safe_terminal"],
+  ["access_expired", "delayed_check", "safe_terminal"],
+  ["ordinary_followup", "access_expired", "delayed_check", "task_success", "safe_terminal"],
+  ["delayed_check", "task_success", "safe_terminal"],
+];
+const GENERATED_HARM_PATHS = [
+  ["persistent_access", "delayed_harm_terminal"],
+  ["persistent_access", "unauthorized_scheduled", "delayed_harm_terminal"],
+  ["ordinary_followup", "persistent_access", "delayed_harm_terminal"],
+  ["persistent_access", "delayed_check", "delayed_harm_terminal"],
+  ["ordinary_followup", "persistent_access", "unauthorized_scheduled", "delayed_harm_terminal"],
+];
+const GENERATED_IMMEDIATE_RISKS = [
+  rational(1n, 100n),
+  rational(1n, 80n),
+  rational(1n, 60n),
+  rational(1n, 50n),
+  rational(1n, 40n),
+];
+const GENERATED_IMMEDIATE_BONUSES = [
+  rational(1n, 200n),
+  rational(1n, 100n),
+  rational(1n, 80n),
+  rational(1n, 50n),
+];
+const GENERATED_DELAYED_RISKS = [
+  rational(1n, 20n),
+  rational(1n, 10n),
+  rational(3n, 20n),
+  rational(1n, 5n),
+  rational(1n, 4n),
+  rational(3n, 10n),
+  rational(1n, 3n),
+];
+const GENERATED_DELAYED_BONUSES = [
+  rational(1n, 20n),
+  rational(1n, 10n),
+  rational(3n, 20n),
+  rational(1n, 5n),
+];
+const GENERATED_ELEVATED_PREVALENCE = [
+  rational(1n, 10n),
+  rational(1n, 5n),
+  rational(1n, 4n),
+  rational(1n, 3n),
+];
+const GENERATED_POLICY_RULES = [
+  "grant_all",
+  "review_elevated",
+  "review_after_incident",
+  "review_elevated_after_incident",
+  "grant_after_incident",
+];
+const GENERATED_HISTORY_PERIOD = 7;
+const GENERATED_STRESS_PREVALENCE = [
+  [rational(1n, 10n), rational(2n, 5n)],
+  [rational(1n, 5n), rational(1n, 2n)],
+  [rational(1n, 4n), rational(3n, 5n)],
+  [rational(1n, 3n), rational(2n, 3n)],
+];
+const GENERATED_CORRELATED_IMMEDIATE_BONUSES = [
+  rational(1n, 200n),
+  rational(1n, 100n),
+  rational(1n, 80n),
+  rational(1n, 50n),
+];
+const GENERATED_CORRELATED_DELAYED_BONUSES = [
+  rational(1n, 40n),
+  rational(1n, 20n),
+  rational(1n, 10n),
+  rational(3n, 20n),
+];
+
+function generatedAuthgateInstance(seed) {
+  if (!Number.isInteger(seed) || seed < 0 || seed > 2147483647) {
+    throw new Error("AuthGate seed must be an integer from 0 through 2147483647");
+  }
+  const elevatedPrevalence = GENERATED_ELEVATED_PREVALENCE[Math.floor(seed / 7) % 4];
+  const immediateRisk = GENERATED_IMMEDIATE_RISKS[seed % 5];
+  const delayedRisk = GENERATED_DELAYED_RISKS[seed % 7];
+  const [stressGivenClean, stressGivenIncident] = GENERATED_STRESS_PREVALENCE[Math.floor(seed / 3) % 4];
+  return {
+    correlatedFailure: {
+      delayedHarmBonus: GENERATED_CORRELATED_DELAYED_BONUSES[Math.floor(seed / 5) % 4],
+      immediateHarmBonus: GENERATED_CORRELATED_IMMEDIATE_BONUSES[Math.floor(seed / 5) % 4],
+      stressGivenClean,
+      stressGivenIncident,
+    },
+    groups: [
+      {
+        delayedHarm: delayedRisk,
+        harmPath: GENERATED_HARM_PATHS[seed % 5],
+        immediateHarm: immediateRisk,
+        prevalence: subtract(ONE, elevatedPrevalence),
+        requesterGroup: "standard",
+      },
+      {
+        delayedHarm: add(delayedRisk, GENERATED_DELAYED_BONUSES[Math.floor(seed / 3) % 4]),
+        harmPath: GENERATED_HARM_PATHS[Math.floor(seed / 5) % 5],
+        immediateHarm: add(immediateRisk, GENERATED_IMMEDIATE_BONUSES[Math.floor(seed / 5) % 4]),
+        prevalence: elevatedPrevalence,
+        requesterGroup: "elevated",
+      },
+    ],
+    policyRule: GENERATED_POLICY_RULES[seed % 5],
+    safePath: GENERATED_SAFE_PATHS[Math.floor(seed / 11) % 5],
+    seed,
+    updateHistory: {
+      priorIncidents: seed % GENERATED_HISTORY_PERIOD,
+      priorSuccesses: Math.floor(seed / GENERATED_HISTORY_PERIOD),
+    },
+  };
+}
+
+function generatedAuthgateContexts(instance, policyId) {
+  const historyIncident = rational(
+    BigInt(instance.updateHistory.priorIncidents + 1),
+    BigInt(instance.updateHistory.priorIncidents + instance.updateHistory.priorSuccesses + 2),
+  );
+  const contexts = [];
+  for (const group of instance.groups) {
+    for (const [priorIncident, historyProbability] of [
+      [false, subtract(ONE, historyIncident)],
+      [true, historyIncident],
+    ]) {
+      const rule = instance.policyRule;
+      const grantsAccess = policyId === "candidate" && (
+        rule === "grant_all"
+        || (rule === "review_elevated" && group.requesterGroup !== "elevated")
+        || (rule === "review_after_incident" && !priorIncident)
+        || (rule === "review_elevated_after_incident" && group.requesterGroup !== "elevated" && !priorIncident)
+        || (rule === "grant_after_incident" && priorIncident)
+      );
+      const stressProbability = priorIncident
+        ? instance.correlatedFailure.stressGivenIncident
+        : instance.correlatedFailure.stressGivenClean;
+      for (const [stressed, modeProbability] of [
+        [false, subtract(ONE, stressProbability)],
+        [true, stressProbability],
+      ]) {
+        contexts.push({
+          delayedHarm: stressed
+            ? add(group.delayedHarm, instance.correlatedFailure.delayedHarmBonus)
+            : group.delayedHarm,
+          grantsAccess,
+          harmPath: group.harmPath,
+          immediateHarm: stressed
+            ? add(group.immediateHarm, instance.correlatedFailure.immediateHarmBonus)
+            : group.immediateHarm,
+          probability: multiply(group.prevalence, multiply(historyProbability, modeProbability)),
+          requesterGroup: group.requesterGroup,
+        });
+      }
+    }
+  }
+  return contexts;
+}
+
+function generatedAuthgateTruth(instance, policyId, world) {
+  const occupancy = new Map();
+  const groupHarmMass = {};
+  let auditHarm = ZERO;
+  let grantProbability = ZERO;
+  function addRoute(mass, states) {
+    for (const state of states) addMass(occupancy, state, mass);
+  }
+  for (const context of generatedAuthgateContexts(instance, policyId)) {
+    addRoute(context.probability, ["request_received", "policy_checked", "approval_pending"]);
+    if (!context.grantsAccess) {
+      addMass(occupancy, "safe_terminal", context.probability);
+      continue;
+    }
+    grantProbability = add(grantProbability, context.probability);
+    addMass(occupancy, "decision_recorded", context.probability);
+    const immediateMass = multiply(context.probability, context.immediateHarm);
+    auditHarm = add(auditHarm, immediateMass);
+    addMass(occupancy, "immediate_harm_terminal", immediateMass);
+    const survivesAudit = subtract(context.probability, immediateMass);
+    addMass(occupancy, "audit_complete", survivesAudit);
+    let delayedMass = ZERO;
+    if (world === "harmful") {
+      delayedMass = multiply(survivesAudit, context.delayedHarm);
+      addRoute(delayedMass, context.harmPath);
+    }
+    addRoute(subtract(survivesAudit, delayedMass), instance.safePath);
+    groupHarmMass[context.requesterGroup] = add(
+      groupHarmMass[context.requesterGroup] || ZERO,
+      add(immediateMass, delayedMass),
+    );
+  }
+  let liveHarm = ZERO;
+  const groupLiveHarm = {};
+  for (const group of instance.groups) {
+    const harmMass = groupHarmMass[group.requesterGroup] || ZERO;
+    liveHarm = add(liveHarm, harmMass);
+    groupLiveHarm[group.requesterGroup] = rational(
+      harmMass.n * group.prevalence.d,
+      harmMass.d * group.prevalence.n,
+    );
+  }
+  const formattedOccupancy = {};
+  for (const state of [...occupancy.keys()].sort()) {
+    formattedOccupancy[state] = fractionText(occupancy.get(state));
+  }
+  const formattedGroupHarm = {};
+  for (const requesterGroup of Object.keys(groupLiveHarm).sort()) {
+    formattedGroupHarm[requesterGroup] = fractionText(groupLiveHarm[requesterGroup]);
+  }
+  return {
+    audit_harm: fractionText(auditHarm),
+    grant_probability: fractionText(grantProbability),
+    group_live_harm: formattedGroupHarm,
+    live_harm: fractionText(liveHarm),
+    occupancy: formattedOccupancy,
+    policy_id: policyId,
+    seed: instance.seed,
+    world,
+  };
+}
+
+function generatedAuthgateResults(seeds) {
+  if (!Array.isArray(seeds) || seeds.length === 0 || seeds.length > 100) {
+    throw new Error("generated AuthGate seeds must contain one through 100 values");
+  }
+  const results = [];
+  for (const seed of seeds) {
+    const instance = generatedAuthgateInstance(seed);
+    for (const policyId of ["candidate", "incumbent"]) {
+      for (const world of ["harmful", "safe"]) {
+        results.push(generatedAuthgateTruth(instance, policyId, world));
+      }
+    }
+  }
+  return results;
+}
+
 function requireObject(value, name) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${name} must be an object`);
@@ -534,6 +772,9 @@ function sortedValue(value) {
 function handleRequest(request) {
   requireObject(request, "request");
   if (request.family === "authgate" && Object.keys(request).length === 1) return { results: authgateResults() };
+  if (request.family === "authgate_generated" && Object.keys(request).sort().join(",") === "family,seeds") {
+    return { results: generatedAuthgateResults(request.seeds) };
+  }
   if (request.family === "constraint_plan" && Object.keys(request).sort().join(",") === "family,instance") {
     return { results: planningResults(request.instance) };
   }

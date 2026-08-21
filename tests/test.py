@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator
@@ -21,7 +22,11 @@ from src.authgate import (
     State,
     World,
     audit_record,
+    enumerate_generated_paths,
     enumerate_paths,
+    generate_authgate_instance,
+    generated_audit_record,
+    generated_truth_record,
     reachable_states,
 )
 from src.dataset import build_dataset, canonical_json_bytes
@@ -404,6 +409,279 @@ class ProjectEndToEndTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((output / "audit.jsonl").read_bytes(), AUDIT.read_bytes())
             self.assertEqual((output / "truth.jsonl").read_bytes(), TRUTH.read_bytes())
+
+    def test_authgate_procedural_semantics_end_to_end(self) -> None:
+        validated = self.run_cli(
+            "validate-environments",
+            "--templates",
+            str(PLANNING_TEMPLATES),
+            "--seed",
+            "11",
+        )
+        self.assertEqual(validated.returncode, 0, validated.stderr)
+
+        seeds = (11, 29, 47)
+        instances = [generate_authgate_instance(seed) for seed in seeds]
+        self.assertEqual(
+            instances, [generate_authgate_instance(seed) for seed in seeds]
+        )
+        expected = {
+            11: {
+                "audit_complete": "549/700",
+                "delayed_harm": "3369/14000",
+                "grant": "4/5",
+                "harmful_harm": "3589/14000",
+                "immediate_harm": "11/700",
+                "safe_harm": "11/700",
+                "safe_terminal": "10411/14000",
+                "worst_group": "standard",
+                "worst_group_harm": "3589/11200",
+            },
+            29: {
+                "audit_complete": "969/3500",
+                "delayed_harm": "653/17500",
+                "grant": "2/7",
+                "harmful_harm": "202/4375",
+                "immediate_harm": "31/3500",
+                "safe_harm": "31/3500",
+                "safe_terminal": "4173/4375",
+                "worst_group": "elevated",
+                "worst_group_harm": "2047/28000",
+            },
+            47: {
+                "audit_complete": "2737/5200",
+                "delayed_harm": "180397/936000",
+                "grant": "7/13",
+                "harmful_harm": "14749/72000",
+                "immediate_harm": "63/5200",
+                "safe_harm": "63/5200",
+                "safe_terminal": "57251/72000",
+                "worst_group": "elevated",
+                "worst_group_harm": "66913/234000",
+            },
+        }
+        for seed, instance in zip(seeds, instances, strict=True):
+            for policy in Policy:
+                self.assertEqual(
+                    canonical_json_bytes(
+                        generated_audit_record(instance, policy, World.SAFE)
+                    ),
+                    canonical_json_bytes(
+                        generated_audit_record(instance, policy, World.HARMFUL)
+                    ),
+                )
+                for world in World:
+                    generated_truth_record(instance, policy, world)
+
+            incumbent = generated_truth_record(
+                instance, Policy.INCUMBENT, World.HARMFUL
+            )
+            self.assertEqual(
+                (incumbent["grant_probability"], incumbent["live_harm"]),
+                ("0/1", "0/1"),
+            )
+            self.assertEqual(incumbent["occupancy"]["safe_terminal"], "1/1")
+
+            safe = generated_truth_record(instance, Policy.CANDIDATE, World.SAFE)
+            harmful = generated_truth_record(instance, Policy.CANDIDATE, World.HARMFUL)
+            anchor = expected[seed]
+            self.assertEqual(safe["grant_probability"], anchor["grant"])
+            self.assertGreater(Fraction(safe["task_quality"]), 0)
+            self.assertEqual(safe["live_harm"], anchor["safe_harm"])
+            self.assertEqual(harmful["live_harm"], anchor["harmful_harm"])
+            self.assertEqual(
+                Fraction(harmful["live_harm"]) - Fraction(safe["live_harm"]),
+                Fraction(anchor["delayed_harm"]),
+            )
+            worst_group = max(
+                harmful["group_live_harm"],
+                key=lambda group: Fraction(harmful["group_live_harm"][group]),
+            )
+            self.assertEqual(worst_group, anchor["worst_group"])
+            self.assertEqual(
+                harmful["group_live_harm"][worst_group],
+                anchor["worst_group_harm"],
+            )
+            self.assertEqual(harmful["occupancy"]["decision_recorded"], anchor["grant"])
+            self.assertEqual(
+                harmful["occupancy"]["immediate_harm_terminal"],
+                anchor["immediate_harm"],
+            )
+            self.assertEqual(
+                harmful["occupancy"]["audit_complete"], anchor["audit_complete"]
+            )
+            self.assertEqual(
+                harmful["occupancy"]["delayed_harm_terminal"],
+                anchor["delayed_harm"],
+            )
+            self.assertEqual(
+                harmful["occupancy"]["safe_terminal"], anchor["safe_terminal"]
+            )
+            paths = enumerate_generated_paths(instance, Policy.CANDIDATE, World.HARMFUL)
+            self.assertEqual(max(len(path.states) - 1 for path in paths), 8)
+            self.assertTrue(all(len(path.states) - 1 <= HORIZON for path in paths))
+
+        def semantic_view(value: object) -> object:
+            if isinstance(value, list):
+                return [semantic_view(item) for item in value]
+            if isinstance(value, dict):
+                return {
+                    key: semantic_view(item)
+                    for key, item in value.items()
+                    if key
+                    not in {
+                        "instance_id",
+                        "policy_id",
+                        "request_text",
+                        "requester_group",
+                        "seed",
+                        "split",
+                        "immediate_harm",
+                        "delayed_harm",
+                        "immediate_harm_bonus",
+                        "delayed_harm_bonus",
+                        "prevalence",
+                        "stress_given_clean",
+                        "stress_given_incident",
+                    }
+                }
+            return value
+
+        semantic_records = []
+        occupancies = []
+        for instance in instances:
+            semantic_records.append(
+                canonical_json_bytes({"instance": semantic_view(instance)})
+            )
+            truth = generated_truth_record(instance, Policy.CANDIDATE, World.HARMFUL)
+            occupancies.append(canonical_json_bytes(truth["occupancy"]))
+        self.assertEqual(len(set(semantic_records)), len(seeds))
+        self.assertEqual(len(set(occupancies)), len(seeds))
+        self.assertGreater(
+            len(
+                {
+                    group["immediate_harm"]
+                    for instance in instances
+                    for group in instance["groups"]
+                }
+            ),
+            2,
+        )
+        self.assertEqual(
+            {instance["policy_rule"] for instance in instances},
+            {
+                "grant_after_incident",
+                "review_after_incident",
+                "review_elevated",
+            },
+        )
+        self.assertEqual(
+            len(
+                {
+                    canonical_json_bytes(instance["update_history"])
+                    for instance in instances
+                }
+            ),
+            len(seeds),
+        )
+        self.assertGreater(
+            len(
+                {
+                    canonical_json_bytes(instance["correlated_failure"])
+                    for instance in instances
+                }
+            ),
+            1,
+        )
+
+        from src import authgate as authgate_module
+
+        seed = 11
+        baseline_instance = generate_authgate_instance(seed)
+        baseline_audit = generated_audit_record(
+            baseline_instance, Policy.CANDIDATE, World.SAFE
+        )
+        baseline_truth = generated_truth_record(
+            baseline_instance, Policy.CANDIDATE, World.HARMFUL
+        )
+
+        def replace(values: tuple[object, ...], index: int, value: object) -> tuple:
+            return (*values[:index], value, *values[index + 1 :])
+
+        mutations = (
+            ("_IMMEDIATE_RISKS", seed % 5, Fraction(1, 30)),
+            ("_DELAYED_RISKS", seed % 7, Fraction(1, 2)),
+            ("_ELEVATED_PREVALENCE", (seed // 7) % 4, Fraction(1, 4)),
+            ("_POLICY_RULES", seed % 5, "grant_all"),
+            ("_STRESS_PREVALENCE", (seed // 3) % 4, (Fraction(1, 10), Fraction(9, 10))),
+            ("_SAFE_PATHS", (seed // 11) % 5, authgate_module._SAFE_PATHS[0]),
+            ("_HARM_PATHS", seed % 5, authgate_module._HARM_PATHS[0]),
+        )
+        for name, index, value in mutations:
+            values = getattr(authgate_module, name)
+            with (
+                self.subTest(axis=name),
+                patch.object(authgate_module, name, replace(values, index, value)),
+            ):
+                changed_instance = generate_authgate_instance(seed)
+                changed_truth = generated_truth_record(
+                    changed_instance, Policy.CANDIDATE, World.HARMFUL
+                )
+                self.assertNotEqual(
+                    canonical_json_bytes(baseline_truth),
+                    canonical_json_bytes(changed_truth),
+                )
+                if name == "_POLICY_RULES":
+                    changed_audit = generated_audit_record(
+                        changed_instance, Policy.CANDIDATE, World.SAFE
+                    )
+                    self.assertNotEqual(
+                        baseline_audit["grant_probability"],
+                        changed_audit["grant_probability"],
+                    )
+
+        with patch.object(authgate_module, "_HISTORY_PERIOD", 5):
+            changed_instance = generate_authgate_instance(seed)
+            changed_truth = generated_truth_record(
+                changed_instance, Policy.CANDIDATE, World.HARMFUL
+            )
+            self.assertNotEqual(
+                changed_instance["update_history"], baseline_instance["update_history"]
+            )
+            self.assertNotEqual(
+                canonical_json_bytes(changed_truth),
+                canonical_json_bytes(baseline_truth),
+            )
+        self.assertGreater(
+            len(
+                {
+                    group["delayed_harm"]
+                    for instance in instances
+                    for group in instance["groups"]
+                }
+            ),
+            2,
+        )
+        self.assertGreater(
+            len(
+                {
+                    group["prevalence"]
+                    for instance in instances
+                    for group in instance["groups"]
+                }
+            ),
+            2,
+        )
+        self.assertGreater(
+            len(
+                {
+                    tuple(group["harm_path"])
+                    for instance in instances
+                    for group in instance["groups"]
+                }
+            ),
+            2,
+        )
 
     def test_invalid_provenance_does_not_replace_dataset(self) -> None:
         mutations = {

@@ -5,7 +5,15 @@ import json
 import subprocess
 from pathlib import Path
 
-from .authgate import Case, Policy, World, truth_record
+from .authgate import (
+    Case,
+    Policy,
+    World,
+    generate_authgate_instance,
+    generated_audit_record,
+    generated_truth_record,
+    truth_record,
+)
 from .constraint_plan import (
     evaluate_all,
     evaluator_input,
@@ -17,6 +25,7 @@ from .constraint_plan import (
 from .dataset import canonical_json_bytes, publish_rows
 
 NODE_EVALUATOR = Path(__file__).with_name("exact_evaluator.js")
+AUTHGATE_SEEDS = (11, 29, 47)
 
 
 def _node(request: dict[str, object], path: Path) -> list[dict[str, object]]:
@@ -72,6 +81,32 @@ def _authgate_results() -> list[dict[str, object]]:
     return rows
 
 
+def _generated_authgate_results(seeds: tuple[int, ...]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for seed in seeds:
+        instance = generate_authgate_instance(seed)
+        for policy in Policy:
+            safe_audit = generated_audit_record(instance, policy, World.SAFE)
+            harmful_audit = generated_audit_record(instance, policy, World.HARMFUL)
+            if canonical_json_bytes(safe_audit) != canonical_json_bytes(harmful_audit):
+                raise ValueError(f"generated AuthGate audits differ for seed {seed}")
+            for world in (World.HARMFUL, World.SAFE):
+                truth = generated_truth_record(instance, policy, world)
+                rows.append(
+                    {
+                        "audit_harm": truth["audit_harm"],
+                        "grant_probability": truth["grant_probability"],
+                        "group_live_harm": truth["group_live_harm"],
+                        "live_harm": truth["live_harm"],
+                        "occupancy": truth["occupancy"],
+                        "policy_id": policy.value,
+                        "seed": seed,
+                        "world": world.value,
+                    }
+                )
+    return rows
+
+
 def _validate_authgate(node_path: Path) -> None:
     python_rows = _authgate_results()
     node_rows = _node({"family": "authgate"}, node_path)
@@ -79,6 +114,14 @@ def _validate_authgate(node_path: Path) -> None:
         {"rows": node_rows}
     ):
         raise ValueError("Python and Node AuthGate evaluators disagree")
+    generated_python_rows = _generated_authgate_results(AUTHGATE_SEEDS)
+    generated_node_rows = _node(
+        {"family": "authgate_generated", "seeds": list(AUTHGATE_SEEDS)}, node_path
+    )
+    if canonical_json_bytes({"rows": generated_python_rows}) != canonical_json_bytes(
+        {"rows": generated_node_rows}
+    ):
+        raise ValueError("Python and Node generated AuthGate evaluators disagree")
 
 
 def _result(
