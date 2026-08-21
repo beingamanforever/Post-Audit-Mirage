@@ -27,7 +27,7 @@ LABELS = {
     "pace_reset": "PACE reset",
     "reused_holdout": "Reusable holdout",
     "sgm_transferred": "Transferred SGM",
-    "monitor": "Monitor unavailable",
+    "monitor": "Live monitor",
     "oracle": "True answer",
     "correct_width": "Correct width",
     "too_narrow": "Too narrow",
@@ -60,7 +60,7 @@ def landscape_svg(rows: list[dict[str, object]], summary: dict[str, object]) -> 
     status = _status(summary, "experiment_2")
     svg += _title_block(
         "Experiment 2  |  The lifecycle landscape",
-        "500 paired runs per cell  •  T = 50  •  color and printed value encode lifecycle rate",
+        "One fixed lifecycle per family and scenario  •  T = 50  •  descriptive rates",
         status,
     )
     columns = (
@@ -74,7 +74,7 @@ def landscape_svg(rows: list[dict[str, object]], summary: dict[str, object]) -> 
         panel_y = 154
         svg += _text(panel_x, panel_y, FAMILY_LABELS[family], 22, NAVY, 500)
         svg += _text(
-            panel_x, panel_y + 25, "controlled lifecycle methods marked ●", 13, MUTED
+            panel_x, panel_y + 25, "pre-registered online controls marked ●", 13, MUTED
         )
         cell_x = panel_x + 238
         for column_index, (_, _, label) in enumerate(columns):
@@ -123,7 +123,7 @@ def landscape_svg(rows: list[dict[str, object]], summary: dict[str, object]) -> 
             panel_x + 505, 827, "Higher acceptance is better", 12, TEAL, 500, "middle"
         )
     svg += _footer(
-        "Transferred SGM carries evidence between different update hypotheses; blue dots identify methods evaluated for lifecycle control."
+        "This stress test violates independence, adaptive-selection, repeated-evidence, and combined-null assumptions; it does not isolate one cause or refute guarantees under their assumptions."
     )
     return svg + "</svg>\n"
 
@@ -218,7 +218,7 @@ def restoration_svg(rows: list[dict[str, object]], summary: dict[str, object]) -
     status = _status(summary, "experiment_4")
     svg += _title_block(
         "Experiment 4  |  Live monitoring restores identifiability",
-        "Log-scaled monitor size  •  lines show classification rates across 500 deployment-like streams",
+        f"Log-scaled monitor size  •  {summary['config']['monitor_replications']} deployment-like streams per point",
         status,
     )
     sizes = sorted(

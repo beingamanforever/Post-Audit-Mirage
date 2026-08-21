@@ -48,12 +48,16 @@ from src.dataset import (
     load_templates as load_auth_templates,
 )
 from src.decision_methods import (
+    AddisSpending,
     ComponentEvidence,
+    OnlineClosedE,
     PaceReset,
     SgmTransferred,
     UpdateEvidence,
 )
 from src.environment_validation import build_planning
+from src.environment_lifecycles import realize_lifecycle, realize_matched_pair
+from src.seqe_guard import seqe_guard
 from src.surface_generation import MODEL, RETURNED_MODELS
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1849,6 +1853,66 @@ class ProjectEndToEndTest(unittest.TestCase):
             ),
         )
 
+    def test_official_addis_and_seqe_guard_parity(self) -> None:
+        addis_fixtures = (
+            (
+                (1e-7, 3e-4, 0.1, 6e-4),
+                (0.0054686270725,) * 4,
+                (True, True, False, True),
+            ),
+            (
+                (0.8, 0.3, 0.25, 0.5, 0.5000000000001, 0.1),
+                (
+                    0.0054686270725,
+                    0.0054686270725,
+                    0.0018039741708076409,
+                    0.0018039741708076409,
+                    0.0009429405242058705,
+                    0.0009429405242058705,
+                ),
+                (False,) * 6,
+            ),
+        )
+        for p_values, expected_levels, expected_rejections in addis_fixtures:
+            method = AddisSpending()
+            decisions = tuple(method.decide_p(p_value) for p_value in p_values)
+            for decision, expected_level in zip(
+                decisions, expected_levels, strict=True
+            ):
+                self.assertTrue(
+                    math.isclose(
+                        decision.threshold,
+                        expected_level,
+                        rel_tol=0,
+                        abs_tol=1e-15,
+                    )
+                )
+            self.assertEqual(
+                tuple(decision.deploy for decision in decisions),
+                expected_rejections,
+            )
+
+        seqe_fixtures = (
+            ((2, 0.5, 25, 8, 100), (1, 3, 4, 5), (0, 0, 1, 1, 2)),
+            ((0.5, 20, 2), (2, 3), (0, 1, 1)),
+            ((5, 2, 5, 2), (1, 2, 3, 4), (0, 1, 2, 2)),
+        )
+        for e_values, queried, expected in seqe_fixtures:
+            self.assertEqual(seqe_guard(e_values, queried, alpha=0.1), expected)
+
+        values = (2, 0.5, 25, 8, 100)
+        official_bounds = tuple(
+            seqe_guard(values[:index], (index,), alpha=0.1)[-1]
+            for index in range(1, len(values) + 1)
+        )
+        method = OnlineClosedE(alpha=0.1)
+        decisions = tuple(method.decide_e(value) for value in values)
+        self.assertEqual(official_bounds, (0, 0, 1, 0, 1))
+        self.assertEqual(
+            tuple(decision.deploy for decision in decisions),
+            tuple(bool(bound) for bound in official_bounds),
+        )
+
         from src.lifecycle import run_methods
 
         observed_monitors: list[tuple[str, object]] = []
@@ -1969,6 +2033,68 @@ class ProjectEndToEndTest(unittest.TestCase):
                     failed.stderr,
                 )
 
+    def test_environment_lifecycles_are_paired_deterministic_and_truth_isolated(
+        self,
+    ) -> None:
+        for family in ("authgate_v0", "constraint_plan_v0"):
+            first = realize_lifecycle(family, "mixed", 31)
+            repeated = realize_lifecycle(family, "mixed", 31)
+            self.assertEqual(first, repeated)
+            self.assertEqual(len(first.public_rounds), 50)
+            self.assertEqual(
+                sum(item.safe_to_deploy for item in first.protected_truth), 15
+            )
+
+            pair = realize_matched_pair(family, 31)
+            self.assertIs(pair.safe.public_rounds, pair.harmful.public_rounds)
+            self.assertTrue(
+                all(item.safe_to_deploy for item in pair.safe.protected_truth)
+            )
+            self.assertTrue(
+                all(not item.safe_to_deploy for item in pair.harmful.protected_truth)
+            )
+            for safe_public, harmful_public in zip(
+                pair.safe.public_rounds,
+                pair.harmful.public_rounds,
+                strict=True,
+            ):
+                self.assertIs(safe_public.update, harmful_public.update)
+
+        null_authgate = realize_lifecycle("authgate_v0", "null_only", 31)
+        self.assertEqual(null_authgate.public_rounds[7].update.pace_outcomes, ())
+        self.assertEqual(
+            null_authgate.public_rounds[0].update.pace_outcomes,
+            (1,) * 32,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            changed_templates = Path(directory) / "planning_templates.json"
+            templates = json.loads(PLANNING_TEMPLATES.read_text(encoding="utf-8"))
+            changed_templates.write_text(json.dumps(templates), encoding="utf-8")
+            baseline_plan = realize_lifecycle(
+                "constraint_plan_v0",
+                "mixed",
+                33,
+                planning_templates=changed_templates,
+            )
+            templates[0]["structure_job_id"] = "j2"
+            changed_templates.write_text(json.dumps(templates), encoding="utf-8")
+            changed_plan = realize_lifecycle(
+                "constraint_plan_v0",
+                "mixed",
+                33,
+                planning_templates=changed_templates,
+            )
+            self.assertNotEqual(baseline_plan, changed_plan)
+            changed_templates.write_text("{", encoding="utf-8")
+            with self.assertRaises(json.JSONDecodeError):
+                realize_lifecycle(
+                    "constraint_plan_v0",
+                    "mixed",
+                    33,
+                    planning_templates=changed_templates,
+                )
+
     def test_phase4_experiments_prove_landscape_limit_and_restoration(self) -> None:
         artifact_filenames = {
             "experiment_impossibility.svg",
@@ -1976,6 +2102,7 @@ class ProjectEndToEndTest(unittest.TestCase):
             "experiment_restoration.svg",
         }
         data_filenames = {
+            "phase4_lifecycles.jsonl",
             "phase4_results.jsonl",
             "phase4_summary.json",
         }
@@ -1998,47 +2125,28 @@ class ProjectEndToEndTest(unittest.TestCase):
             summary = json.loads(
                 (output / "phase4_summary.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                summary["config"],
-                {
-                    "alpha": 0.05,
-                    "audit_batch": 64,
-                    "lifecycle_length": 50,
-                    "monitor_sizes": [
-                        5,
-                        10,
-                        20,
-                        50,
-                        100,
-                        200,
-                        500,
-                        1000,
-                        2500,
-                        5000,
-                        10000,
-                        20000,
-                    ],
-                    "monitor_truth": {
-                        "authgate_v0": {
-                            "harmful": [0.2, 0.05],
-                            "safe": [0.02, 0.05],
-                        },
-                        "constraint_plan_v0": {
-                            "harmful": [1.0, 0.15],
-                            "safe": [0.0, 0.15],
-                        },
-                    },
-                    "replications": 500,
-                    "seed": 20260821,
-                },
-            )
+            config = summary["config"]
+            self.assertEqual(config["alpha"], 0.05)
+            self.assertEqual(config["environment_updates"], 300)
+            self.assertEqual(config["lifecycle_length"], 50)
+            self.assertEqual(config["monitor_replications"], 500)
+            self.assertEqual(config["seed"], 20260821)
+            for family, limit in (
+                ("authgate_v0", 0.05),
+                ("constraint_plan_v0", 0.15),
+            ):
+                safe_rate, safe_limit = config["monitor_truth"][family]["safe"]
+                harmful_rate, harmful_limit = config["monitor_truth"][family]["harmful"]
+                self.assertEqual((safe_limit, harmful_limit), (limit, limit))
+                self.assertLess(safe_rate, limit)
+                self.assertGreater(harmful_rate, limit)
             self.assertEqual(
                 {
                     name: result["status"]
                     for name, result in summary["experiments"].items()
                 },
                 {
-                    "experiment_2": "passed",
+                    "experiment_2": "failed",
                     "experiment_3": "passed",
                     "experiment_4": "passed",
                 },
@@ -2073,18 +2181,79 @@ class ProjectEndToEndTest(unittest.TestCase):
             ]
             self.assertTrue(
                 all(
-                    row["successes"] == 500
+                    row["successes"] == 1
                     for row in landscape
-                    if row["method"] == "sgm_transferred"
+                    if row["method"]
+                    in {"addis_spending", "online_closed_e", "sgm_transferred"}
                 )
             )
             self.assertTrue(
                 all(
-                    row["ci_upper"] <= 0.05
+                    row["successes"] == 0
                     for row in landscape
-                    if row["method"]
-                    in {"shrinking_budget", "addis_spending", "online_closed_e"}
+                    if row["method"] in {"monitor", "oracle"}
                 )
+            )
+            descriptive = [
+                row
+                for row in rows
+                if row["experiment"] in {"experiment_2", "experiment_3"}
+            ]
+            self.assertTrue(
+                all(
+                    row["ci_lower"] is None
+                    and row["ci_upper"] is None
+                    and row["uncertainty"] == "descriptive_fixed_lifecycle"
+                    for row in descriptive
+                )
+            )
+
+            lifecycle_rows = read_jsonl(output / "phase4_lifecycles.jsonl")
+            self.assertEqual(len(lifecycle_rows), 300)
+            self.assertEqual(
+                {(row["family"], row["scenario"]) for row in lifecycle_rows},
+                {
+                    (family, scenario)
+                    for family in ("authgate_v0", "constraint_plan_v0")
+                    for scenario in ("null_only", "all_good", "mixed")
+                },
+            )
+            for family in ("authgate_v0", "constraint_plan_v0"):
+                for scenario, expected_safe in (
+                    ("null_only", 0),
+                    ("all_good", 50),
+                    ("mixed", 15),
+                ):
+                    selected = [
+                        row
+                        for row in lifecycle_rows
+                        if row["family"] == family and row["scenario"] == scenario
+                    ]
+                    self.assertEqual(len(selected), 50)
+                    self.assertEqual(
+                        sum(row["safe_to_deploy"] for row in selected),
+                        expected_safe,
+                    )
+                    self.assertTrue(all(row["public_components"] for row in selected))
+            observed_modes = {
+                mode
+                for row in lifecycle_rows
+                for field in ("public_failure_modes", "truth_failure_modes")
+                for mode in row[field]
+            }
+            self.assertTrue(
+                {
+                    "adaptive_public_selection",
+                    "correlated_updates",
+                    "delayed_harm",
+                    "group_dependent_drift",
+                    "incorrect_combined_null_stress",
+                    "missing_monitoring",
+                    "monitor_shift",
+                    "partial_evidence_transfer",
+                    "repeated_similar_updates",
+                    "selection_biased_monitoring",
+                }.issubset(observed_modes)
             )
 
             paired = [
@@ -2130,6 +2299,11 @@ class ProjectEndToEndTest(unittest.TestCase):
             restoration_svg = (artifacts / "experiment_restoration.svg").read_text(
                 encoding="utf-8"
             )
+            landscape_svg = (artifacts / "experiment_landscape.svg").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("adaptive-selection", landscape_svg)
+            self.assertIn("combined-null assumptions", landscape_svg)
             self.assertIn('stroke-dasharray="7 4"', restoration_svg)
             self.assertIn('stroke-dasharray="2 4"', restoration_svg)
             self.assertIn("<rect", restoration_svg)
@@ -2164,10 +2338,60 @@ class ProjectEndToEndTest(unittest.TestCase):
                     (Path(second_directory) / "artifacts" / filename).read_bytes(),
                 )
 
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing"
+            failed = self.run_cli(
+                "run-experiments",
+                "--data-dir",
+                str(missing),
+                "--output-dir",
+                str(Path(directory) / "output"),
+                "--artifacts-dir",
+                str(Path(directory) / "artifacts"),
+                "--replications",
+                "1",
+            )
+            self.assertEqual(failed.returncode, 2)
+            self.assertIn("missing planning templates", failed.stderr)
+
+        from src.experiments import run_experiments
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_summary = run_experiments(
+                root / "one-data",
+                artifacts_dir=root / "one-artifacts",
+                data_dir=ROOT / "data",
+                replications=1,
+                seed=23,
+            )
+            second_summary = run_experiments(
+                root / "many-data",
+                artifacts_dir=root / "many-artifacts",
+                data_dir=ROOT / "data",
+                replications=30,
+                seed=23,
+            )
+            self.assertEqual(
+                first_summary["experiments"]["experiment_2"],
+                second_summary["experiments"]["experiment_2"],
+            )
+            self.assertEqual(
+                first_summary["experiments"]["experiment_3"],
+                second_summary["experiments"]["experiment_3"],
+            )
+            first_rows = read_jsonl(root / "one-data" / "phase4_results.jsonl")
+            second_rows = read_jsonl(root / "many-data" / "phase4_results.jsonl")
+            self.assertEqual(
+                [row for row in first_rows if row["experiment"] != "experiment_4"],
+                [row for row in second_rows if row["experiment"] != "experiment_4"],
+            )
+
     def test_phase4_publication_failure_restores_every_artifact(self) -> None:
         from src.experiments import run_experiments
 
         data_filenames = (
+            "phase4_lifecycles.jsonl",
             "phase4_results.jsonl",
             "phase4_summary.json",
         )

@@ -24,6 +24,7 @@ METHOD_NAMES = (
     "monitor",
     "oracle",
 )
+PUBLIC_METHOD_NAMES = METHOD_NAMES[:-1]
 
 
 @dataclass(frozen=True)
@@ -211,7 +212,11 @@ class AddisSpending:
         update: UpdateEvidence,
         monitor: MonitorEvidence | None = None,
     ) -> Decision:
-        p_value = _combined_p(update.components)
+        return self.decide_p(_combined_p(update.components))
+
+    def decide_p(self, p_value: float) -> Decision:
+        if not math.isfinite(p_value) or not 0 <= p_value <= 1:
+            raise ValueError("ADDIS p-value must be finite and within [0, 1]")
         index = self.selected - self.candidates
         gamma = ADDIS_GAMMA_SCALE / ((index + 1) ** 1.6)
         level = self.alpha * (self.discard - self.candidate) * gamma
@@ -233,7 +238,11 @@ class OnlineClosedE:
         update: UpdateEvidence,
         monitor: MonitorEvidence | None = None,
     ) -> Decision:
-        e_value = _combined_e(update.components)
+        return self.decide_e(_combined_e(update.components))
+
+    def decide_e(self, e_value: float) -> Decision:
+        if not math.isfinite(e_value) or e_value < 0:
+            raise ValueError("sequential e-value must be finite and nonnegative")
         # For the singleton claim about the current update, the least favorable
         # intersection includes every earlier e-value below one and excludes
         # every earlier e-value above one.
@@ -385,6 +394,17 @@ def build_methods(
     alpha: float = ALPHA,
     seed: int = 0,
 ) -> tuple[DecisionMethod, ...]:
+    methods = (*build_public_methods(alpha=alpha, seed=seed), Oracle(answers))
+    if tuple(method.name for method in methods) != METHOD_NAMES:
+        raise AssertionError("method registry is incomplete")
+    return methods
+
+
+def build_public_methods(
+    *,
+    alpha: float = ALPHA,
+    seed: int = 0,
+) -> tuple[DecisionMethod, ...]:
     methods: tuple[DecisionMethod, ...] = (
         AlwaysHold(),
         Greedy(),
@@ -396,10 +416,9 @@ def build_methods(
         ReusedHoldout(seed=seed),
         SgmTransferred(alpha),
         Monitor(alpha),
-        Oracle(answers),
     )
-    if tuple(method.name for method in methods) != METHOD_NAMES:
-        raise AssertionError("method registry is incomplete")
+    if tuple(method.name for method in methods) != PUBLIC_METHOD_NAMES:
+        raise AssertionError("public method registry is incomplete")
     return methods
 
 

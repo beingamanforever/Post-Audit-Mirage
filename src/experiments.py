@@ -10,7 +10,13 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Iterable
 
-from .decision_methods import ALPHA, ComponentEvidence, UpdateEvidence, build_methods
+from .decision_methods import ALPHA, Oracle, build_public_methods
+from .environment_lifecycles import (
+    MatchedLifecyclePair,
+    RealizedLifecycle,
+    realize_lifecycle,
+    realize_matched_pair,
+)
 from .experiment_plots import impossibility_svg, landscape_svg, restoration_svg
 
 FAMILIES = ("authgate_v0", "constraint_plan_v0")
@@ -45,20 +51,46 @@ def run_experiments(
     if not 0 < alpha < 1:
         raise ValueError("alpha must be within (0, 1)")
 
+    family_seeds = {
+        family: _seed(seed, "environment", family) % (2**31) for family in FAMILIES
+    }
     data_dir = data_dir or Path(__file__).resolve().parents[1] / "data"
-    monitor_settings = _monitor_settings(data_dir)
-    landscape = _run_landscape(replications, seed, alpha)
-    impossibility = _run_impossibility(replications, seed, alpha)
+    planning_templates = data_dir / "planning_templates.json"
+    if not planning_templates.is_file():
+        raise ValueError(f"missing planning templates: {planning_templates}")
+    lifecycles = {
+        (family, scenario): realize_lifecycle(
+            family,
+            scenario,
+            family_seeds[family],
+            planning_templates=planning_templates,
+        )
+        for family in FAMILIES
+        for scenario in SCENARIOS
+    }
+    matched_pairs = {
+        family: realize_matched_pair(
+            family,
+            family_seeds[family],
+            planning_templates=planning_templates,
+        )
+        for family in FAMILIES
+    }
+    monitor_settings = _monitor_settings(matched_pairs)
+    landscape = _run_landscape(lifecycles, seed, alpha)
+    impossibility = _run_impossibility(matched_pairs, seed, alpha)
     restoration = _run_restoration(replications, seed, alpha, monitor_settings)
     rows = landscape + impossibility + restoration
     summary = {
         "config": {
             "alpha": alpha,
-            "audit_batch": 64,
+            "environment_updates": sum(
+                len(lifecycle.public_rounds) for lifecycle in lifecycles.values()
+            ),
             "lifecycle_length": 50,
             "monitor_sizes": list(MONITOR_SIZES),
             "monitor_truth": monitor_settings,
-            "replications": replications,
+            "monitor_replications": replications,
             "seed": seed,
         },
         "experiments": {
@@ -69,6 +101,9 @@ def run_experiments(
     }
     artifacts_dir = artifacts_dir or output_dir
     payloads = {
+        output_dir / "phase4_lifecycles.jsonl": "".join(
+            _json_line(row) for row in _lifecycle_rows(lifecycles.values())
+        ),
         output_dir / "phase4_results.jsonl": "".join(_json_line(row) for row in rows),
         output_dir / "phase4_summary.json": _json_line(summary),
         artifacts_dir / "experiment_landscape.svg": landscape_svg(landscape, summary),
@@ -84,7 +119,7 @@ def run_experiments(
 
 
 def _run_landscape(
-    replications: int,
+    lifecycles: dict[tuple[str, str], RealizedLifecycle],
     seed: int,
     alpha: float,
 ) -> list[dict[str, object]]:
@@ -93,73 +128,70 @@ def _run_landscape(
     )
     for family in FAMILIES:
         for scenario in SCENARIOS:
-            for replication in range(replications):
-                random_source = _random(
-                    seed, "landscape", family, scenario, replication
+            lifecycle = lifecycles[(family, scenario)]
+            answers = {
+                (family, public.update.update_id): truth.safe_to_deploy
+                for public, truth in zip(
+                    lifecycle.public_rounds,
+                    lifecycle.protected_truth,
+                    strict=True,
                 )
-                updates: list[UpdateEvidence] = []
-                safe: list[bool] = []
-                for round_index in range(1, 51):
-                    probability, is_safe = _scripted_round(scenario, round_index)
-                    updates.append(
-                        _sample_update(
-                            family,
-                            f"{scenario}-{round_index}",
-                            probability,
-                            random_source,
-                        )
-                    )
-                    safe.append(is_safe)
-                answers = {
-                    (family, update.update_id): is_safe
-                    for update, is_safe in zip(updates, safe, strict=True)
-                }
-                methods = build_methods(
-                    answers,
+            }
+            methods = (
+                *build_public_methods(
                     alpha=alpha,
-                    seed=_seed(seed, "thresholdout", family, scenario, replication),
-                )
-                for method in methods:
-                    harmful_deployed = False
-                    first_harm = 0
-                    good_deployed = 0
-                    good_total = 0
-                    utility = 0
-                    for round_index, (update, is_safe) in enumerate(
-                        zip(updates, safe, strict=True), start=1
-                    ):
-                        decision = method.decide(update)
-                        if is_safe:
-                            good_total += 1
-                            good_deployed += decision.deploy
-                            utility += decision.deploy
-                        elif decision.deploy:
-                            harmful_deployed = True
-                            first_harm = first_harm or round_index
-                            utility -= 1
-                    key = (family, scenario, method.name)
-                    counts[key]["harm_lifecycles"] += harmful_deployed
-                    counts[key]["good_deployed"] += good_deployed
-                    counts[key]["good_total"] += good_total
-                    counts[key]["first_harm_sum"] += first_harm
-                    counts[key]["first_harm_count"] += bool(first_harm)
-                    counts[key]["utility_sum"] += utility
+                    seed=_seed(seed, "thresholdout", family, scenario),
+                ),
+                Oracle(answers),
+            )
+            for method in methods:
+                harmful_deployed = False
+                first_harm = 0
+                good_deployed = 0
+                good_total = 0
+                utility = 0
+                for round_index, (public, truth) in enumerate(
+                    zip(
+                        lifecycle.public_rounds,
+                        lifecycle.protected_truth,
+                        strict=True,
+                    ),
+                    start=1,
+                ):
+                    monitor = truth.monitor if method.name == "monitor" else None
+                    decision = method.decide(public.update, monitor)
+                    is_safe = truth.safe_to_deploy
+                    if is_safe:
+                        good_total += 1
+                        good_deployed += decision.deploy
+                        utility += decision.deploy
+                    elif decision.deploy:
+                        harmful_deployed = True
+                        first_harm = first_harm or round_index
+                        utility -= 1
+                key = (family, scenario, method.name)
+                counts[key]["harm_lifecycles"] += harmful_deployed
+                counts[key]["good_deployed"] += good_deployed
+                counts[key]["good_total"] += good_total
+                counts[key]["first_harm_sum"] += first_harm
+                counts[key]["first_harm_count"] += bool(first_harm)
+                counts[key]["utility_sum"] += utility
 
     rows: list[dict[str, object]] = []
     for (family, scenario, method), values in sorted(counts.items()):
         rows.append(
-            _rate_row(
+            _descriptive_rate_row(
                 "experiment_2",
                 family,
                 scenario,
                 method,
                 "harmful_lifecycle",
                 int(values["harm_lifecycles"]),
-                replications,
+                1,
             )
         )
         rows.append(
-            _rate_row(
+            _descriptive_rate_row(
                 "experiment_2",
                 family,
                 scenario,
@@ -170,7 +202,7 @@ def _run_landscape(
             )
         )
         rows.append(
-            _mean_row(
+            _descriptive_mean_row(
                 "experiment_2",
                 family,
                 scenario,
@@ -181,21 +213,65 @@ def _run_landscape(
             )
         )
         rows.append(
-            _mean_row(
+            _descriptive_mean_row(
                 "experiment_2",
                 family,
                 scenario,
                 method,
                 "final_utility",
                 values["utility_sum"],
-                replications,
+                1,
             )
         )
     return rows
 
 
+def _lifecycle_rows(
+    lifecycles: Iterable[RealizedLifecycle],
+) -> list[dict[str, object]]:
+    rows = []
+    for lifecycle in lifecycles:
+        for public, truth in zip(
+            lifecycle.public_rounds,
+            lifecycle.protected_truth,
+            strict=True,
+        ):
+            rows.append(
+                {
+                    "environment_ids": list(public.environment_ids),
+                    "family": lifecycle.family,
+                    "lifecycle_seed": lifecycle.seed,
+                    "monitor_available": truth.monitor is not None,
+                    "proposal_id": public.proposal_id,
+                    "public_components": [
+                        {
+                            "audit": list(component.audit),
+                            "holdout": list(component.holdout),
+                            "name": component.name,
+                            "require_all": component.require_all,
+                        }
+                        for component in public.update.components
+                    ],
+                    "public_failure_modes": list(public.failure_modes),
+                    "round": public.index + 1,
+                    "safe_to_deploy": truth.safe_to_deploy,
+                    "scenario": lifecycle.scenario,
+                    "truth_failure_modes": list(truth.failure_modes),
+                    "truth_metrics": {
+                        metric.name: (
+                            f"{metric.value.numerator}/{metric.value.denominator}"
+                        )
+                        for metric in truth.metrics
+                    },
+                    "update_id": public.update.update_id,
+                    "world": truth.world,
+                }
+            )
+    return rows
+
+
 def _run_impossibility(
-    replications: int,
+    matched_pairs: dict[str, MatchedLifecyclePair],
     seed: int,
     alpha: float,
 ) -> list[dict[str, object]]:
@@ -203,76 +279,76 @@ def _run_impossibility(
     matched: dict[tuple[str, str], int] = defaultdict(int)
     abstained: dict[str, int] = defaultdict(int)
     for family in FAMILIES:
-        for replication in range(replications):
-            update = _sample_update(
-                family,
-                "matched-update",
-                0.8,
-                _random(seed, "impossibility", family, replication),
+        pair = matched_pairs[family]
+        decisions: dict[str, dict[str, tuple[object, ...]]] = {}
+        for world, lifecycle in (("safe", pair.safe), ("harmful", pair.harmful)):
+            methods = build_public_methods(
+                alpha=alpha,
+                seed=_seed(seed, "impossibility-thresholdout", family),
             )
-            decisions: dict[str, dict[str, tuple[object, ...]]] = {}
-            for world, answer in (("safe", True), ("harmful", False)):
-                methods = build_methods(
-                    {(family, update.update_id): answer},
-                    alpha=alpha,
-                    seed=_seed(seed, "impossibility-thresholdout", family, replication),
+            decisions[world] = {}
+            for method in methods:
+                if method.name not in OFFLINE_METHODS:
+                    continue
+                lifecycle_decisions = tuple(
+                    method.decide(public.update) for public in lifecycle.public_rounds
                 )
-                decisions[world] = {}
-                for method in methods:
-                    if method.name not in OFFLINE_METHODS:
-                        continue
-                    decision = method.decide(update)
-                    decisions[world][method.name] = (
+                decisions[world][method.name] = tuple(
+                    (
                         decision.deploy,
                         decision.reason,
                         decision.statistic,
                         decision.threshold,
                     )
-                    accepted[(family, world, method.name)] += decision.deploy
-            for method in OFFLINE_METHODS:
-                matched[(family, method)] += (
-                    decisions["safe"][method] == decisions["harmful"][method]
+                    for decision in lifecycle_decisions
                 )
-            abstained[family] += (
-                identified_range_status(frozenset({True, False})) == "cannot_determine"
+                accepted[(family, world, method.name)] += any(
+                    decision.deploy for decision in lifecycle_decisions
+                )
+        for method in OFFLINE_METHODS:
+            matched[(family, method)] += (
+                decisions["safe"][method] == decisions["harmful"][method]
             )
+        abstained[family] += (
+            identified_range_status(frozenset({True, False})) == "cannot_determine"
+        )
 
     rows: list[dict[str, object]] = []
     for family in FAMILIES:
         for method in OFFLINE_METHODS:
             for world in ("safe", "harmful"):
                 rows.append(
-                    _rate_row(
+                    _descriptive_rate_row(
                         "experiment_3",
                         family,
                         world,
                         method,
                         "acceptance",
                         accepted[(family, world, method)],
-                        replications,
+                        1,
                     )
                 )
             rows.append(
-                _rate_row(
+                _descriptive_rate_row(
                     "experiment_3",
                     family,
                     "paired_worlds",
                     method,
                     "paired_decision_match",
                     matched[(family, method)],
-                    replications,
+                    1,
                 )
             )
         for world in ("safe", "harmful"):
             rows.append(
-                _rate_row(
+                _descriptive_rate_row(
                     "experiment_3",
                     family,
                     world,
                     "identified_range",
                     "cannot_determine",
                     abstained[family],
-                    replications,
+                    1,
                 )
             )
     return rows
@@ -377,17 +453,17 @@ def _landscape_status(rows: list[dict[str, object]]) -> dict[str, object]:
     for family in FAMILIES:
         sgm = _find(rows, family, "mixed", "sgm_transferred", "harmful_lifecycle")
         best_controlled = max(
-            float(_find(rows, family, "mixed", method, "harmful_lifecycle")["ci_upper"])
+            float(_find(rows, family, "mixed", method, "harmful_lifecycle")["estimate"])
             for method in CONTROLLED_METHODS
         )
-        separated.append(float(sgm["ci_lower"]) >= best_controlled + 0.20)
+        separated.append(float(sgm["estimate"]) >= best_controlled + 0.20)
     criteria = {
-        "controlled_harm_upper_at_most_0_05": all(
-            float(row["ci_upper"]) <= 0.05 for row in controlled_harm
+        "controlled_harm_at_most_0_05": all(
+            float(row["estimate"]) <= 0.05 for row in controlled_harm
         ),
         "nontrivial_all_good_acceptance": all(
             any(
-                float(row["ci_lower"]) > 0.30
+                float(row["estimate"]) > 0.30
                 for row in controlled_acceptance
                 if row["family"] == family
             )
@@ -412,7 +488,7 @@ def _impossibility_status(rows: list[dict[str, object]]) -> dict[str, object]:
             harmful = _find(rows, family, "harmful", method, "acceptance")
             found |= (
                 safe["successes"] == harmful["successes"]
-                and float(safe["ci_lower"]) > 0.30
+                and float(safe["estimate"]) > 0.30
             )
         nontrivial.append(found)
     criteria = {
@@ -503,86 +579,27 @@ def _restoration_status(rows: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def _scripted_round(scenario: str, round_index: int) -> tuple[float, bool]:
-    if scenario == "all_good":
-        return 0.8, True
-    if scenario == "mixed" and round_index <= 15:
-        return 0.8, True
-    return (0.5, False) if scenario == "null_only" else (0.2, False)
-
-
 def _monitor_settings(
-    data_dir: Path,
+    matched_pairs: dict[str, MatchedLifecyclePair],
 ) -> dict[str, dict[str, tuple[float, float]]]:
-    auth_rows = [
-        row
-        for row in _read_jsonl(data_dir / "truth.jsonl")
-        if row.get("policy_id") == "candidate"
-        and row.get("action") == "grant_temporary_access"
-    ]
-    planning_rows = [
-        row
-        for row in _read_jsonl(data_dir / "planning_truth.jsonl")
-        if row.get("policy_id") == "p4"
-    ]
-    observed = {
-        "authgate_v0": {
-            world: {
-                _fraction(row, "live_harm")
-                for row in auth_rows
-                if row.get("world") == world
-            }
-            for world in ("safe", "harmful")
-        },
-        "constraint_plan_v0": {
-            world: {
-                _fraction(row, "rare_group_harm")
-                for row in planning_rows
-                if row.get("world") == world
-            }
-            for world in ("safe", "harmful")
-        },
-    }
-    expected = {
-        "authgate_v0": {"safe": {Fraction(1, 50)}, "harmful": {Fraction(1, 5)}},
-        "constraint_plan_v0": {"safe": {Fraction(0)}, "harmful": {Fraction(1)}},
-    }
-    if observed != expected:
-        raise ValueError("committed monitor truth does not match the Phase 4 protocol")
     limits = {"authgate_v0": 0.05, "constraint_plan_v0": 0.15}
-    return {
-        family: {
-            world: (float(next(iter(rates))), limits[family])
-            for world, rates in worlds.items()
-        }
-        for family, worlds in observed.items()
-    }
-
-
-def _sample_update(
-    family: str,
-    update_id: str,
-    win_probability: float,
-    random_source: random.Random,
-) -> UpdateEvidence:
-    audit = tuple(
-        1.0 if random_source.random() < win_probability else -1.0 for _ in range(64)
-    )
-    holdout = tuple(
-        1.0 if random_source.random() < win_probability else -1.0 for _ in range(32)
-    )
-    names = (
-        ("harm", "quality")
-        if family == "authgate_v0"
-        else ("public_feasibility", "objective")
-    )
-    components = tuple(ComponentEvidence(name, audit, holdout) for name in names)
-    return UpdateEvidence(
-        family=family,
-        update_id=update_id,
-        components=components,
-        pace_outcomes=tuple(value > 0 for value in audit),
-    )
+    settings = {}
+    for family in FAMILIES:
+        pair = matched_pairs[family]
+        metric_name = "live_harm" if family == "authgate_v0" else "rare_group_harm"
+        settings[family] = {}
+        for world, lifecycle in (("safe", pair.safe), ("harmful", pair.harmful)):
+            values = [
+                metric.value
+                for truth in lifecycle.protected_truth
+                for metric in truth.metrics
+                if metric.name == metric_name
+            ]
+            settings[family][world] = (
+                float(sum(values, Fraction()) / len(values)),
+                limits[family],
+            )
+    return settings
 
 
 def _confidence_sequence_status(
@@ -641,6 +658,30 @@ def _rate_row(
     }
 
 
+def _descriptive_rate_row(
+    experiment: str,
+    family: str,
+    scenario: str,
+    method: str,
+    metric: str,
+    successes: int,
+    trials: int,
+) -> dict[str, object]:
+    return {
+        "ci_lower": None,
+        "ci_upper": None,
+        "estimate": successes / trials if trials else 0.0,
+        "experiment": experiment,
+        "family": family,
+        "method": method,
+        "metric": metric,
+        "scenario": scenario,
+        "successes": successes,
+        "trials": trials,
+        "uncertainty": "descriptive_fixed_lifecycle",
+    }
+
+
 def _mean_row(
     experiment: str,
     family: str,
@@ -662,6 +703,28 @@ def _mean_row(
         "trials": trials,
         "value_sum": value_sum,
     }
+
+
+def _descriptive_mean_row(
+    experiment: str,
+    family: str,
+    scenario: str,
+    method: str,
+    metric: str,
+    value_sum: float,
+    trials: int,
+) -> dict[str, object]:
+    row = _mean_row(
+        experiment,
+        family,
+        scenario,
+        method,
+        metric,
+        value_sum,
+        trials,
+    )
+    row["uncertainty"] = "descriptive_fixed_lifecycle"
+    return row
 
 
 def _wilson(successes: int, trials: int) -> tuple[float, float]:
