@@ -2907,6 +2907,187 @@ class ProjectEndToEndTest(unittest.TestCase):
                     (artifacts / filename).read_bytes(), previous[filename]
                 )
 
+    def test_paired_inference_controls_multiplicity_end_to_end(self) -> None:
+        from src.paired_inference import (
+            LifecycleOutcome,
+            exact_one_sided_mcnemar_p,
+            exact_one_sided_sign_p,
+            holm_adjust,
+            run_paired_inference,
+        )
+
+        self.assertEqual(exact_one_sided_mcnemar_p(1, 9), 11 / 1024)
+        self.assertEqual(exact_one_sided_mcnemar_p(2, 8), 56 / 1024)
+        self.assertEqual(exact_one_sided_mcnemar_p(0, 6), 1 / 64)
+        self.assertEqual(exact_one_sided_mcnemar_p(0, 0), 1)
+        self.assertEqual(exact_one_sided_sign_p(0, 0), 1)
+        self.assertEqual(
+            holm_adjust((("H1", 0.01), ("H2", 0.03), ("H3", 0.04))),
+            {"H1": 0.03, "H2": 0.06, "H3": 0.06},
+        )
+        self.assertEqual(
+            holm_adjust((("B", 0.02), ("C", 0.5), ("A", 0.02))),
+            {"B": 0.06, "C": 0.5, "A": 0.06},
+        )
+
+        outcomes = []
+        for family_index, family in enumerate(
+            ("authgate_v0", "constraint_plan_v0", "batch_triage_v0")
+        ):
+            for scenario_index, scenario in enumerate(
+                ("null_only", "all_good", "mixed")
+            ):
+                for replicate in range(100):
+                    environment_seed = (
+                        family_index * 100_000 + scenario_index * 1_000 + replicate
+                    )
+                    for method in (
+                        "online_closed_e",
+                        "addis_spending",
+                        "shrinking_budget",
+                    ):
+                        candidate = method == "online_closed_e"
+                        outcomes.append(
+                            LifecycleOutcome(
+                                family=family,
+                                scenario=scenario,
+                                environment_seed=environment_seed,
+                                lifecycle_seed=environment_seed + 10,
+                                method_seed=environment_seed + 20,
+                                method=method,
+                                harmful_lifecycle=not candidate,
+                                genuine_acceptance=0.8 if candidate else 0.2,
+                                final_utility=0.6 if candidate else -0.2,
+                            )
+                        )
+
+        result = run_paired_inference(outcomes)
+        replay = run_paired_inference(reversed(outcomes))
+        self.assertEqual(result, replay)
+        self.assertEqual(result["overall_label"], "best")
+        self.assertEqual(
+            [row["hypothesis_id"] for row in result["comparisons"]],
+            ["H1", "H2", "H3", "H4", "H5", "H6"],
+        )
+        self.assertTrue(all(row["claim_eligible"] for row in result["comparisons"]))
+        self.assertTrue(all(row["adjusted_p"] <= 0.05 for row in result["comparisons"]))
+
+        tied = [
+            LifecycleOutcome(
+                family=outcome.family,
+                scenario=outcome.scenario,
+                environment_seed=outcome.environment_seed,
+                lifecycle_seed=outcome.lifecycle_seed,
+                method_seed=outcome.method_seed,
+                method=outcome.method,
+                harmful_lifecycle=False,
+                genuine_acceptance=0.5,
+                final_utility=0,
+            )
+            for outcome in outcomes
+        ]
+        tied_result = run_paired_inference(tied)
+        self.assertEqual(tied_result["overall_label"], "no_superiority_established")
+        self.assertTrue(
+            all(
+                row["informative_pairs"] == 0 and row["raw_p"] == 1
+                for row in tied_result["comparisons"]
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing paired methods"):
+            run_paired_inference(outcomes[:-1])
+        with self.assertRaisesRegex(ValueError, "duplicate outcome"):
+            run_paired_inference((*outcomes, outcomes[0]))
+        repeated_unit = [
+            LifecycleOutcome(
+                family=outcome.family,
+                scenario=outcome.scenario,
+                environment_seed=outcome.environment_seed,
+                lifecycle_seed=outcome.lifecycle_seed + 1,
+                method_seed=outcome.method_seed,
+                method=outcome.method,
+                harmful_lifecycle=outcome.harmful_lifecycle,
+                genuine_acceptance=outcome.genuine_acceptance,
+                final_utility=outcome.final_utility,
+            )
+            for outcome in outcomes[:3]
+        ]
+        with self.assertRaisesRegex(ValueError, "repeated independent lifecycle unit"):
+            run_paired_inference((*outcomes, *repeated_unit))
+
+        def changed(outcome: LifecycleOutcome, **updates: object) -> LifecycleOutcome:
+            return LifecycleOutcome(**(asdict(outcome) | updates))
+
+        wrong_family = [
+            changed(outcome, family="typo_family") if index < 3 else outcome
+            for index, outcome in enumerate(outcomes)
+        ]
+        with self.assertRaisesRegex(ValueError, "prespecified set"):
+            run_paired_inference(wrong_family)
+        with self.assertRaisesRegex(ValueError, "exactly 100"):
+            run_paired_inference(outcomes[:-3])
+        extra_unit = [
+            changed(outcome, environment_seed=999_999) for outcome in outcomes[-3:]
+        ]
+        with self.assertRaisesRegex(ValueError, "exactly 100"):
+            run_paired_inference((*outcomes, *extra_unit))
+        aliased = [
+            changed(outcome, environment_seed=0) if 900 <= index < 903 else outcome
+            for index, outcome in enumerate(outcomes)
+        ]
+        with self.assertRaisesRegex(ValueError, "reused across benchmark cells"):
+            run_paired_inference(aliased)
+        for invalid_samples in (True, 10_000.0, 1, 9_999, 10_001):
+            with self.assertRaisesRegex(ValueError, "bootstrap_samples"):
+                run_paired_inference(outcomes, bootstrap_samples=invalid_samples)
+
+        reversal = [
+            changed(
+                outcome,
+                harmful_lifecycle=outcome.method == "online_closed_e",
+            )
+            if outcome.family == "authgate_v0" and outcome.scenario != "all_good"
+            else outcome
+            for outcome in outcomes
+        ]
+        reversal_result = run_paired_inference(reversal)
+        self.assertEqual(reversal_result["overall_label"], "no_superiority_established")
+        self.assertTrue(
+            all(
+                "family_harm_direction_reversal" in row["failure_reasons"]
+                for row in reversal_result["comparator_results"]
+            )
+        )
+
+        heterogeneous = []
+        for outcome in outcomes:
+            acceptance = outcome.genuine_acceptance
+            if outcome.method == "online_closed_e":
+                if (
+                    outcome.family in {"authgate_v0", "constraint_plan_v0"}
+                    and outcome.scenario == "all_good"
+                ):
+                    acceptance = 1
+                elif outcome.family == "authgate_v0" and outcome.scenario == "mixed":
+                    acceptance = 0 if outcome.environment_seed % 100 < 50 else 0.4
+                elif outcome.scenario in {"all_good", "mixed"}:
+                    acceptance = 0.4
+            heterogeneous.append(changed(outcome, genuine_acceptance=acceptance))
+        heterogeneous_result = run_paired_inference(heterogeneous)
+        self.assertEqual(
+            heterogeneous_result,
+            run_paired_inference(reversed(heterogeneous)),
+        )
+        by_hypothesis = {
+            row["hypothesis_id"]: row for row in heterogeneous_result["comparisons"]
+        }
+        for hypothesis_id in ("H2", "H5"):
+            row = by_hypothesis[hypothesis_id]
+            self.assertAlmostEqual(row["effect"], 11 / 30, places=14)
+            self.assertAlmostEqual(row["ci_lower"], 0.36, places=14)
+            self.assertAlmostEqual(row["ci_upper"], 0.3726666666666667, places=14)
+
 
 if __name__ == "__main__":
     unittest.main()
