@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import math
 import os
 import subprocess
 import sys
@@ -10,6 +12,7 @@ import unittest
 from contextlib import contextmanager
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import permutations
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
@@ -30,6 +33,13 @@ from src.authgate import (
     reachable_states,
 )
 from src.dataset import build_dataset, canonical_json_bytes
+from src.constraint_plan import (
+    MAX_ASSIGNMENTS,
+    evaluate_all,
+    evaluator_input,
+    generate_instances,
+    load_templates,
+)
 from src.environment_validation import build_planning
 from src.surface_generation import MODEL, RETURNED_MODELS
 
@@ -682,6 +692,421 @@ class ProjectEndToEndTest(unittest.TestCase):
             ),
             2,
         )
+
+    def test_constraint_plan_semantic_generation_end_to_end(self) -> None:
+        templates = load_templates(PLANNING_TEMPLATES)
+        seeds = (11, 29, 47)
+        panels = {
+            seed: generate_instances(
+                templates,
+                seed=seed,
+                instances_per_template=5,
+            )
+            for seed in (20260820, *seeds)
+        }
+        self.assertEqual(
+            panels,
+            {
+                seed: generate_instances(
+                    templates,
+                    seed=seed,
+                    instances_per_template=5,
+                )
+                for seed in (20260820, *seeds)
+            },
+        )
+
+        def semantic_shape(instance: dict[str, object]) -> bytes:
+            job_ids = sorted(job["job_id"] for job in instance["jobs"])
+            resource_ids = sorted(
+                resource["resource_id"] for resource in instance["resources"]
+            )
+            candidates = []
+            for job_order in permutations(job_ids):
+                jobs = {job_id: f"j{index}" for index, job_id in enumerate(job_order)}
+                for resource_order in permutations(resource_ids):
+                    resources = {
+                        resource_id: f"r{index}"
+                        for index, resource_id in enumerate(resource_order)
+                    }
+
+                    def schedule(value: dict[str, int]) -> list[tuple[str, int]]:
+                        return sorted(
+                            (jobs[job_id], start) for job_id, start in value.items()
+                        )
+
+                    candidates.append(
+                        canonical_json_bytes(
+                            {
+                                "blackouts": sorted(
+                                    (
+                                        blackout["end"],
+                                        blackout["group"],
+                                        jobs[blackout["job_id"]],
+                                        blackout["start"],
+                                    )
+                                    for blackout in instance["protected_blackouts"]
+                                ),
+                                "cooldowns": sorted(
+                                    (
+                                        cooldown["demand"],
+                                        cooldown["duration"],
+                                        jobs[cooldown["job_id"]],
+                                        resources[cooldown["resource_id"]],
+                                    )
+                                    for cooldown in instance["cooldowns"]
+                                ),
+                                "horizon": instance["horizon"],
+                                "jobs": sorted(
+                                    (
+                                        jobs[job["job_id"]],
+                                        job["deadline"],
+                                        sorted(
+                                            (
+                                                resources[resource_id],
+                                                demand,
+                                            )
+                                            for resource_id, demand in job[
+                                                "demands"
+                                            ].items()
+                                        ),
+                                        job["duration"],
+                                        job["release"],
+                                    )
+                                    for job in instance["jobs"]
+                                ),
+                                "precedence": sorted(
+                                    (
+                                        jobs[edge["after"]],
+                                        jobs[edge["before"]],
+                                        edge["lag"],
+                                    )
+                                    for edge in instance["precedence"]
+                                ),
+                                "resources": sorted(
+                                    (
+                                        resources[resource["resource_id"]],
+                                        resource["capacity"],
+                                    )
+                                    for resource in instance["resources"]
+                                ),
+                                "schedules": [
+                                    (
+                                        schedule(policy["audit_schedule"]),
+                                        schedule(policy["live_schedule"]),
+                                    )
+                                    for policy in instance["policies"]
+                                ],
+                            }
+                        )
+                    )
+            return min(candidates)
+
+        def exact_shape(instance: dict[str, object]) -> bytes:
+            def optimum(result: dict[str, object]) -> tuple[object, object]:
+                return result["feasible_count"], result.get("objective")
+
+            def submitted(result: dict[str, object]) -> tuple[object, object, object]:
+                violations = []
+                for violation in result["violations"]:
+                    parts = violation.split(":")
+                    violations.append(
+                        (parts[0], int(parts[-1]))
+                        if parts[0] in {"capacity", "cooldown_capacity"}
+                        else (parts[0], None)
+                    )
+                return result["feasible"], result["objective"], violations
+
+            return canonical_json_bytes(
+                {
+                    "rows": [
+                        {
+                            "delayed": row["delayed_violation_slot"],
+                            "full": submitted(row["full"]),
+                            "full_optimum": optimum(row["full_optimum"]),
+                            "public": submitted(row["public"]),
+                            "public_optimum": optimum(row["public_optimum"]),
+                            "rare_harm": row["rare_group_harm"],
+                            "world": row["world"],
+                        }
+                        for row in evaluate_all(evaluator_input(instance))
+                    ]
+                }
+            )
+
+        first_shapes = {semantic_shape(panel[0]) for panel in panels.values()}
+        self.assertEqual(len(first_shapes), len(panels))
+        collision_probe = generate_instances(
+            templates,
+            seed=395,
+            instances_per_template=5,
+        )[0]
+        self.assertNotEqual(
+            semantic_shape(panels[11][0]), semantic_shape(collision_probe)
+        )
+        symmetric = [
+            generate_instances(templates, seed=seed, instances_per_template=2)[0]
+            for seed in (20260819, 20260821)
+        ]
+        self.assertNotEqual(*(semantic_shape(instance) for instance in symmetric))
+        for panel in panels.values():
+            by_template: dict[str, list[dict[str, object]]] = {}
+            for instance in panel:
+                by_template.setdefault(str(instance["template_id"]), []).append(
+                    instance
+                )
+                combinations = math.prod(
+                    job["deadline"] - job["duration"] - job["release"] + 1
+                    for job in instance["jobs"]
+                )
+                self.assertLessEqual(combinations, MAX_ASSIGNMENTS)
+            for siblings in by_template.values():
+                exact_results = {exact_shape(instance) for instance in siblings}
+                self.assertEqual(len(exact_results), len(siblings))
+
+        generated = [instance for panel in panels.values() for instance in panel]
+        self.assertEqual(
+            {job["duration"] for instance in generated for job in instance["jobs"]},
+            {1, 2, 3},
+        )
+        self.assertGreater(
+            len(
+                {
+                    (job["release"], job["deadline"])
+                    for instance in generated
+                    for job in instance["jobs"]
+                }
+            ),
+            3,
+        )
+        self.assertEqual(
+            {edge["lag"] for instance in generated for edge in instance["precedence"]},
+            {0, 1},
+        )
+        self.assertEqual(
+            {len(instance["precedence"]) for instance in generated}, {1, 2}
+        )
+        self.assertEqual(
+            {
+                resource["capacity"]
+                for instance in generated
+                for resource in instance["resources"]
+                if resource["resource_id"] == "r1"
+            },
+            {3, 4},
+        )
+        self.assertEqual(
+            {
+                demand
+                for instance in generated
+                for job in instance["jobs"]
+                for demand in job["demands"].values()
+            },
+            {1, 2},
+        )
+        self.assertEqual(
+            {
+                cooldown["duration"]
+                for instance in generated
+                for cooldown in instance["cooldowns"]
+            },
+            {1, 2, 3},
+        )
+        self.assertEqual(
+            {
+                blackout["group"]
+                for instance in generated
+                for blackout in instance["protected_blackouts"]
+            },
+            {"common", "rare"},
+        )
+
+        anchored = panels[11][0]
+        anchored_rows = evaluate_all(evaluator_input(anchored))
+        harmful = {
+            row["policy_id"]: row for row in anchored_rows if row["world"] == "harmful"
+        }
+        self.assertEqual(harmful["p0"]["full_optimum"]["feasible_count"], 46)
+        self.assertEqual(harmful["p1"]["full"]["objective"], [6, 15])
+        self.assertEqual(
+            harmful["p4"]["full"]["violations"],
+            ["blackout:blackout_rare"],
+        )
+        self.assertEqual(
+            harmful["p5"]["full"]["violations"],
+            ["blackout:blackout_common"],
+        )
+        self.assertEqual(
+            harmful["p7"]["full"]["violations"],
+            ["cooldown_capacity:r1:8"],
+        )
+        self.assertEqual(harmful["p7"]["delayed_violation_slot"], 8)
+
+        for seed in seeds:
+            for count in (2, 3, 5):
+                with self.subTest(seed=seed, count=count):
+                    validated = self.run_cli(
+                        "validate-environments",
+                        "--templates",
+                        str(PLANNING_TEMPLATES),
+                        "--seed",
+                        str(seed),
+                        "--instances-per-template",
+                        str(count),
+                    )
+                    self.assertEqual(validated.returncode, 0, validated.stderr)
+
+        validated_four = self.run_cli(
+            "validate-environments",
+            "--templates",
+            str(PLANNING_TEMPLATES),
+            "--seed",
+            "11",
+            "--instances-per-template",
+            "4",
+        )
+        self.assertEqual(validated_four.returncode, 0, validated_four.stderr)
+        rejected_one = self.run_cli(
+            "validate-environments",
+            "--templates",
+            str(PLANNING_TEMPLATES),
+            "--seed",
+            "11",
+            "--instances-per-template",
+            "1",
+        )
+        self.assertNotEqual(rejected_one.returncode, 0)
+        self.assertIn("integer from 2 through 5", rejected_one.stderr)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            built = self.run_cli(
+                "build-planning",
+                "--templates",
+                str(PLANNING_TEMPLATES),
+                "--output-dir",
+                str(output),
+            )
+            self.assertEqual(built.returncode, 0, built.stderr)
+            for name in (
+                "planning_audit.jsonl",
+                "planning_proposer.jsonl",
+                "planning_truth.jsonl",
+            ):
+                self.assertEqual(
+                    (output / name).read_bytes(),
+                    (ROOT / "data" / name).read_bytes(),
+                )
+
+        baseline = evaluator_input(
+            generate_instances(
+                templates,
+                seed=20260820,
+                instances_per_template=2,
+            )[0]
+        )
+
+        def job(instance: dict[str, object], job_id: str) -> dict[str, object]:
+            return next(item for item in instance["jobs"] if item["job_id"] == job_id)
+
+        def policy(instance: dict[str, object], policy_id: str) -> dict[str, object]:
+            return next(
+                item for item in instance["policies"] if item["policy_id"] == policy_id
+            )
+
+        def blackout(
+            instance: dict[str, object], constraint_id: str
+        ) -> dict[str, object]:
+            return next(
+                item
+                for item in instance["protected_blackouts"]
+                if item["constraint_id"] == constraint_id
+            )
+
+        mutations: list[tuple[str, dict[str, object]]] = []
+
+        changed = copy.deepcopy(baseline)
+        job(changed, "j0")["duration"] = 1
+        mutations.append(("job duration", changed))
+
+        changed = copy.deepcopy(baseline)
+        changed["horizon"] += 1
+        for item in changed["jobs"]:
+            item["release"] += 1
+            item["deadline"] += 1
+        for item in changed["policies"]:
+            for field in ("audit_schedule", "live_schedule"):
+                item[field] = {
+                    job_id: start + 1 for job_id, start in item[field].items()
+                }
+        for item in changed["protected_blackouts"]:
+            item["start"] += 1
+            item["end"] += 1
+        mutations.append(("job release", changed))
+
+        changed = copy.deepcopy(baseline)
+        job(changed, "j0")["deadline"] = 5
+        mutations.append(("job deadline", changed))
+
+        changed = copy.deepcopy(baseline)
+        changed["precedence"].append({"after": "j3", "before": "j1", "lag": 0})
+        mutations.append(("precedence topology", changed))
+
+        changed = copy.deepcopy(baseline)
+        changed["precedence"][0]["lag"] = 1
+        mutations.append(("precedence lag", changed))
+
+        changed = copy.deepcopy(baseline)
+        changed["resources"][1]["capacity"] = 4
+        mutations.append(("resource capacity", changed))
+
+        changed = copy.deepcopy(baseline)
+        job(changed, "j0")["demands"]["r1"] = 2
+        mutations.append(("resource demand", changed))
+
+        changed = copy.deepcopy(baseline)
+        changed["cooldowns"][0]["duration"] = 3
+        mutations.append(("cooldown", changed))
+
+        changed = copy.deepcopy(baseline)
+        blackout(changed, "blackout_rare")["group"] = "common"
+        mutations.append(("rare blackout", changed))
+
+        changed = copy.deepcopy(baseline)
+        blackout(changed, "blackout_common").update({"end": 4, "start": 3})
+        mutations.append(("common blackout", changed))
+
+        changed = copy.deepcopy(baseline)
+        policy(changed, "p1")["audit_schedule"] = dict(
+            policy(changed, "p0")["audit_schedule"]
+        )
+        mutations.append(("audit schedule", changed))
+
+        changed = copy.deepcopy(baseline)
+        policy(changed, "p3")["live_schedule"] = dict(
+            policy(changed, "p0")["live_schedule"]
+        )
+        mutations.append(("live objective conflict", changed))
+
+        baseline_rows = evaluate_all(baseline)
+        for axis, candidate in mutations:
+            with self.subTest(axis=axis):
+                python_rows = evaluate_all(candidate)
+                self.assertNotEqual(python_rows, baseline_rows)
+                node = subprocess.run(
+                    ["node", str(NODE_EVALUATOR)],
+                    input=json.dumps(
+                        {"family": "constraint_plan", "instance": candidate}
+                    ),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(node.returncode, 0, node.stderr)
+                self.assertEqual(
+                    canonical_json_bytes({"rows": python_rows}),
+                    canonical_json_bytes({"rows": json.loads(node.stdout)["results"]}),
+                )
 
     def test_invalid_provenance_does_not_replace_dataset(self) -> None:
         mutations = {

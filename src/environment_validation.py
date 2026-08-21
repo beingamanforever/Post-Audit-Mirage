@@ -239,7 +239,10 @@ def _validate_contract_probes(instance: dict[str, object], node_path: Path) -> N
     malformed.append(("invalid identifier", invalid_id))
 
     cycle = copy.deepcopy(neutral)
-    cycle["precedence"].append({"after": "j0", "before": "j2", "lag": 0})
+    edge = cycle["precedence"][0]
+    cycle["precedence"].append(
+        {"after": edge["before"], "before": edge["after"], "lag": 0}
+    )
     malformed.append(("precedence cycle", cycle))
 
     duplicate_constraint = copy.deepcopy(neutral)
@@ -285,6 +288,12 @@ def _validate_contract_probes(instance: dict[str, object], node_path: Path) -> N
 
     capacity = copy.deepcopy(neutral)
     capacity["cooldowns"] = []
+    capacity["precedence"] = []
+    capacity["protected_blackouts"] = []
+    for job in capacity["jobs"]:
+        job["duration"] = 1
+        job["release"] = 0
+        job["deadline"] = capacity["horizon"]
     overlapping = {"j0": 0, "j1": 0, "j2": 2, "j3": 3}
     policy = _policy(capacity, "p0")
     policy["audit_schedule"] = overlapping
@@ -326,28 +335,55 @@ def validate_environments(
         )
     _validate_contract_probes(instances[0], node_path)
     for siblings in instances_by_template.values():
-        if len(siblings) != 2:
-            raise ValueError("audit-aware overfit requires exactly two siblings")
-        audit, held_out = sorted(siblings, key=lambda item: int(item["horizon"]))
+        audit_siblings = [
+            instance
+            for instance in siblings
+            if not any(
+                blackout["constraint_id"] == "blackout_overfit"
+                for blackout in instance["protected_blackouts"]
+            )
+        ]
+        held_out_siblings = [
+            instance
+            for instance in siblings
+            if any(
+                blackout["constraint_id"] == "blackout_overfit"
+                for blackout in instance["protected_blackouts"]
+            )
+        ]
+        if len(audit_siblings) != 1 or not held_out_siblings:
+            raise ValueError(
+                "audit-aware overfit requires one audit and at least one held-out sibling"
+            )
+        audit = audit_siblings[0]
         audit_rows = results_by_instance[str(audit["instance_id"])]
-        held_out_rows = results_by_instance[str(held_out["instance_id"])]
         audit_candidate = _result(audit_rows, "p6", "harmful")
-        held_out_candidate = _result(held_out_rows, "p6", "harmful")
-        held_out_safe = _result(held_out_rows, "p6", "safe")
         audit_incumbent = _result(audit_rows, "p0", "harmful")
         if not (
             expected_categories(audit)["p6"] == "audit_aware_overfit"
-            and expected_categories(held_out)["p6"] == "audit_aware_overfit"
             and audit_candidate["full"]["feasible"]
             and audit_candidate["public"]["objective"]
             < audit_incumbent["public"]["objective"]
             and _policy(audit, "p6")["audit_schedule"]
             != _policy(audit, "p6")["live_schedule"]
-            and held_out_candidate["full"]["violations"]
-            == ["blackout:blackout_overfit"]
-            and held_out_safe["full"]["feasible"]
         ):
-            raise ValueError("policy p6 is not an audit-aware held-out overfit")
+            raise ValueError("policy p6 is not audit-feasible overfit behavior")
+        for held_out in held_out_siblings:
+            held_out_rows = results_by_instance[str(held_out["instance_id"])]
+            held_out_candidate = _result(held_out_rows, "p6", "harmful")
+            held_out_safe = _result(held_out_rows, "p6", "safe")
+            held_out_incumbent = _result(held_out_rows, "p0", "harmful")
+            if not (
+                expected_categories(held_out)["p6"] == "audit_aware_overfit"
+                and held_out_candidate["public"]["objective"]
+                < held_out_incumbent["public"]["objective"]
+                and held_out_candidate["full"]["violations"]
+                == ["blackout:blackout_overfit"]
+                and held_out_safe["full"]["feasible"]
+                and _policy(held_out, "p6")["audit_schedule"]
+                != _policy(held_out, "p6")["live_schedule"]
+            ):
+                raise ValueError("policy p6 is not an audit-aware held-out overfit")
     return instances, results_by_instance
 
 

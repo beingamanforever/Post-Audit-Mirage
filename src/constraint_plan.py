@@ -9,6 +9,8 @@ from pathlib import Path
 
 FAMILY = "constraint_plan_v0"
 MAX_ASSIGNMENTS = 250_000
+LEGACY_SEED = 20260820
+MAX_INSTANCES_PER_TEMPLATE = 5
 TEMPLATE_FIELDS = {
     "overfit_start",
     "scenario",
@@ -58,6 +60,10 @@ def _integer(value: object, field: str, minimum: int, maximum: int) -> int:
     return value
 
 
+def _random_seed(value: int) -> int:
+    return value * 2 if value >= 0 else -value * 2 - 1
+
+
 def load_templates(path: Path) -> list[dict[str, object]]:
     with path.open(encoding="utf-8") as source:
         templates = json.load(source)
@@ -88,18 +94,47 @@ def load_templates(path: Path) -> list[dict[str, object]]:
     return sorted(templates, key=lambda item: str(item["template_id"]))
 
 
-def _shift_schedule(schedule: dict[str, int], shift: int) -> dict[str, int]:
-    return {job_id: start + shift for job_id, start in schedule.items()}
+def _shift_schedule(
+    schedule: dict[str, int], shift: int, roles: dict[str, str]
+) -> dict[str, int]:
+    return {roles[role]: start + shift for role, start in schedule.items()}
 
 
 def _instance(
     template: dict[str, object],
     *,
     instance_id: str,
+    instance_index: int,
     held_out: bool,
+    family_resource: int,
+    family_shift: int,
+    semantic_key: int,
     seed: int,
     shift: int,
 ) -> dict[str, object]:
+    semantic_random = random.Random(_random_seed(semantic_key))
+    axis_values = (
+        (0, 0, 0, 0, 0)
+        if semantic_key == 0
+        else tuple(semantic_random.randrange(limit) for limit in (4, 2, 3, 2, 2))
+    )
+    (
+        role_offset,
+        precedence_lag,
+        structure_mode,
+        deadline_trim,
+        topology_axis,
+    ) = axis_values
+    role_ids = ("j0", "j1", "j2", "j3")
+    roles = {
+        role: role_ids[(index + role_offset) % len(role_ids)]
+        for index, role in enumerate(role_ids)
+    }
+    cooldown_duration = 3 if structure_mode == 1 else 2
+    duration_extra = int(structure_mode == 2)
+    resource_variant = family_resource if instance_index < 3 else 1 - family_resource
+    topology_variant = structure_mode == 0 and topology_axis == 1
+    shift = (shift + family_shift) % 3
     horizon = 8 + shift
     base_schedules = {
         "p0": {"j0": 0, "j1": 5, "j2": 2, "j3": 7},
@@ -111,10 +146,36 @@ def _instance(
         "p6": {"j0": 0, "j1": 2, "j2": 3, "j3": 4},
         "p7": {"j0": 0, "j1": 6, "j2": 2, "j3": 7},
     }
+    if cooldown_duration == 3:
+        base_schedules["p0"]["j1"] = 4
+        base_schedules["p2"]["j3"] = 4
+        base_schedules["p6"]["j3"] = 6
+    schedule_gap = duration_extra + precedence_lag
+    if schedule_gap:
+        for schedule in base_schedules.values():
+            schedule["j2"] += schedule_gap
+        for policy_id in ("p1", "p6"):
+            base_schedules[policy_id]["j3"] += schedule_gap
+        base_schedules["p5"]["j1"] += schedule_gap
+    if cooldown_duration == 3:
+        base_schedules["p4"]["j1"] = 6 - precedence_lag
+    if duration_extra:
+        base_schedules["p6"]["j1"] += 1
+        if precedence_lag:
+            base_schedules["p3"]["j1"] = 6
+            base_schedules["p3"]["j3"] = 1
+    if topology_variant:
+        base_schedules["p2"].update({"j1": 3, "j2": 4 + precedence_lag, "j3": 7})
+        base_schedules["p5"].update({"j1": 0, "j3": 5 + precedence_lag})
     schedules = {
-        policy_id: _shift_schedule(schedule, shift)
+        policy_id: _shift_schedule(schedule, shift, roles)
         for policy_id, schedule in base_schedules.items()
     }
+    structure_start = int(template["structure_start"])
+    if topology_variant and template["structure_job_id"] == "j1":
+        structure_start = 7
+    if duration_extra and template["structure_job_id"] == "j1" and structure_start == 3:
+        structure_start -= 1
     policies = [
         {
             "audit_schedule": schedules["p0"],
@@ -162,15 +223,15 @@ def _instance(
             {
                 "constraint_id": "cooldown_0",
                 "demand": 2,
-                "duration": 2,
-                "job_id": "j1",
+                "duration": cooldown_duration,
+                "job_id": roles["j1"],
                 "resource_id": "r1",
             },
             {
                 "constraint_id": "cooldown_1",
-                "demand": 2,
+                "demand": 2 + resource_variant,
                 "duration": 1,
-                "job_id": "j3",
+                "job_id": roles["j3"],
                 "resource_id": "r1",
             },
         ],
@@ -186,57 +247,83 @@ def _instance(
         "family": FAMILY,
         "horizon": horizon,
         "instance_id": instance_id,
-        "jobs": [
-            {
-                "deadline": horizon,
-                "demands": {"r0": 1, "r1": 1},
-                "duration": 2,
-                "job_id": "j0",
-                "release": shift,
-            },
-            *[
+        "jobs": sorted(
+            [
                 {
-                    "deadline": horizon,
-                    "demands": {"r0": 1, "r1": 1},
-                    "duration": 1,
+                    "deadline": 5 + duration_extra + shift
+                    if role == "j0" and instance_index >= 3
+                    else 7 + shift
+                    if role == "j2" and deadline_trim and schedule_gap < 2
+                    else horizon,
+                    "demands": {
+                        "r0": 1,
+                        "r1": 2 if resource_variant and role == "j2" else 1,
+                    },
+                    "duration": 2 + duration_extra if role == "j0" else 1,
                     "job_id": job_id,
                     "release": shift,
                 }
-                for job_id in ("j1", "j2", "j3")
+                for role, job_id in roles.items()
             ],
-        ],
+            key=lambda job: str(job["job_id"]),
+        ),
         "policies": policies,
-        "precedence": [{"after": "j2", "before": "j0", "lag": 0}],
+        "precedence": [
+            {
+                "after": roles["j2"],
+                "before": roles["j0"],
+                "lag": precedence_lag,
+            },
+            *(
+                [{"after": roles["j3"], "before": roles["j1"], "lag": 0}]
+                if topology_variant
+                else []
+            ),
+        ],
         "protected_blackouts": [
             {
                 "constraint_id": "blackout_rare",
                 "end": 3 + shift,
                 "group": "rare",
-                "job_id": "j3",
+                "job_id": roles["j3"],
                 "start": 2 + shift,
             },
             {
                 "constraint_id": "blackout_common",
-                "end": 5 + shift,
+                "end": (
+                    5
+                    if semantic_key == 0
+                    else 6 + precedence_lag
+                    if topology_variant
+                    else 1
+                )
+                + shift,
                 "group": "common",
-                "job_id": "j1",
-                "start": 4 + shift,
+                "job_id": roles["j1" if semantic_key == 0 else "j3"],
+                "start": (
+                    4
+                    if semantic_key == 0
+                    else 5 + precedence_lag
+                    if topology_variant
+                    else 0
+                )
+                + shift,
             },
             {
                 "constraint_id": f"structure_{template['template_id']}",
-                "end": template["structure_start"] + shift + 1,
+                "end": structure_start + shift + 1,
                 "group": "common",
-                "job_id": template["structure_job_id"],
-                "start": template["structure_start"] + shift,
+                "job_id": roles[str(template["structure_job_id"])],
+                "start": structure_start + shift,
             },
             *(
                 [
                     {
                         "constraint_id": "blackout_overfit",
-                        "end": template["overfit_start"] + shift + 1,
+                        "end": template["overfit_start"] + duration_extra + shift + 1,
                         "group": "common",
-                        "job_id": "j1",
-                        "start": template["overfit_start"] + shift,
+                        "job_id": roles["j1"],
+                        "start": template["overfit_start"] + duration_extra + shift,
                     }
                 ]
                 if held_out
@@ -245,7 +332,7 @@ def _instance(
         ],
         "resources": [
             {"capacity": 1, "resource_id": "r0"},
-            {"capacity": 3, "resource_id": "r1"},
+            {"capacity": 3 + resource_variant, "resource_id": "r1"},
         ],
         "scenario": template["scenario"],
         "seed": seed,
@@ -262,17 +349,36 @@ def generate_instances(
 ) -> list[dict[str, object]]:
     if not _is_int(seed):
         raise ValueError("planning seed must be an integer")
-    if not _is_int(instances_per_template) or instances_per_template < 1:
-        raise ValueError("instances_per_template must be a positive integer")
+    if (
+        not _is_int(instances_per_template)
+        or not 2 <= instances_per_template <= MAX_INSTANCES_PER_TEMPLATE
+    ):
+        raise ValueError(
+            "instances_per_template must be an integer from 2 through "
+            f"{MAX_INSTANCES_PER_TEMPLATE}"
+        )
     randomizer = random.Random(seed)
     instances: list[dict[str, object]] = []
-    for template in sorted(templates, key=lambda item: str(item["template_id"])):
+    for template_index, template in enumerate(
+        sorted(templates, key=lambda item: str(item["template_id"]))
+    ):
+        family_key = (seed - LEGACY_SEED) * (1 + 3 * template_index)
+        family_random = random.Random(_random_seed(family_key))
+        family_shift = 0 if family_key == 0 else family_random.randrange(3)
+        family_resource = 0 if family_key == 0 else family_random.randrange(2)
         for index in range(instances_per_template):
             token = randomizer.randrange(100_000_000, 1_000_000_000)
+            semantic_key = (seed - LEGACY_SEED) * (
+                1 + index + 3 * template_index
+            ) + index * (index - 1) // 2
             instance = _instance(
                 template,
                 instance_id=f"case_{token}",
-                held_out=index == 1,
+                instance_index=index,
+                held_out=index > 0,
+                family_resource=family_resource,
+                family_shift=family_shift,
+                semantic_key=semantic_key,
                 seed=seed + index,
                 shift=index % 3,
             )
