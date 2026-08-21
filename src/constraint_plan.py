@@ -7,6 +7,8 @@ import re
 from itertools import product
 from pathlib import Path
 
+from .structural_splits import PUBLIC_SPLITS, validate_structural_splits
+
 FAMILY = "constraint_plan_v0"
 MAX_ASSIGNMENTS = 250_000
 LEGACY_SEED = 20260820
@@ -16,6 +18,7 @@ TEMPLATE_FIELDS = {
     "scenario",
     "split",
     "structure_job_id",
+    "structure_mode",
     "structure_start",
     "template_id",
 }
@@ -67,30 +70,41 @@ def _random_seed(value: int) -> int:
 def load_templates(path: Path) -> list[dict[str, object]]:
     with path.open(encoding="utf-8") as source:
         templates = json.load(source)
-    if not isinstance(templates, list) or len(templates) != 3:
-        raise ValueError("planning templates must contain exactly three rows")
+    if not isinstance(templates, list) or not templates:
+        raise ValueError("planning templates must contain rows")
 
-    seen: set[str] = set()
     splits: set[str] = set()
     for template in templates:
         if not isinstance(template, dict) or set(template) != TEMPLATE_FIELDS:
             raise ValueError("planning template has unexpected fields")
-        template_id = _identifier(template["template_id"], "template_id")
-        if template_id in seen:
-            raise ValueError("planning template IDs must be unique")
+        _identifier(template["template_id"], "template_id")
         scenario = template["scenario"]
         split = template["split"]
         if not isinstance(scenario, str) or not scenario.strip():
             raise ValueError("planning scenario must be a non-empty string")
-        if split not in {"development", "diagnostic", "confirmation"}:
+        if split not in PUBLIC_SPLITS:
             raise ValueError("planning template has an unknown split")
         _identifier(template["structure_job_id"], "structure_job_id")
+        if template["structure_mode"] not in {"branch", "chain"}:
+            raise ValueError("planning structure_mode must be branch or chain")
         _integer(template["structure_start"], "structure_start", 0, 7)
         _integer(template["overfit_start"], "overfit_start", 0, 7)
-        seen.add(template_id)
         splits.add(str(split))
-    if splits != {"development", "diagnostic", "confirmation"}:
-        raise ValueError("planning templates must cover all three splits")
+    if splits != PUBLIC_SPLITS:
+        raise ValueError("planning templates must cover development and diagnostic")
+    validate_structural_splits(
+        templates,
+        descriptor_fields=(
+            "overfit_start",
+            "structure_job_id",
+            "structure_mode",
+            "structure_start",
+        ),
+        parent_field="structure_mode",
+    )
+    template_ids = [str(template["template_id"]) for template in templates]
+    if len(template_ids) != len(set(template_ids)):
+        raise ValueError("planning template IDs must be unique")
     return sorted(templates, key=lambda item: str(item["template_id"]))
 
 
@@ -114,26 +128,27 @@ def _instance(
 ) -> dict[str, object]:
     semantic_random = random.Random(_random_seed(semantic_key))
     axis_values = (
-        (0, 0, 0, 0, 0)
+        (0, 0, 0, 0)
         if semantic_key == 0
-        else tuple(semantic_random.randrange(limit) for limit in (4, 2, 3, 2, 2))
+        else tuple(semantic_random.randrange(limit) for limit in (4, 2, 3, 2))
     )
     (
         role_offset,
         precedence_lag,
-        structure_mode,
+        shape_mode,
         deadline_trim,
-        topology_axis,
     ) = axis_values
     role_ids = ("j0", "j1", "j2", "j3")
     roles = {
         role: role_ids[(index + role_offset) % len(role_ids)]
         for index, role in enumerate(role_ids)
     }
-    cooldown_duration = 3 if structure_mode == 1 else 2
-    duration_extra = int(structure_mode == 2)
+    topology_variant = template["structure_mode"] == "branch"
+    if topology_variant:
+        shape_mode = 0
+    cooldown_duration = 3 if shape_mode == 1 else 2
+    duration_extra = int(shape_mode == 2)
     resource_variant = family_resource if instance_index < 3 else 1 - family_resource
-    topology_variant = structure_mode == 0 and topology_axis == 1
     shift = (shift + family_shift) % 3
     horizon = 8 + shift
     base_schedules = {
@@ -291,20 +306,22 @@ def _instance(
             {
                 "constraint_id": "blackout_common",
                 "end": (
-                    5
-                    if semantic_key == 0
-                    else 6 + precedence_lag
+                    6 + precedence_lag
                     if topology_variant
+                    else 5
+                    if semantic_key == 0
                     else 1
                 )
                 + shift,
                 "group": "common",
-                "job_id": roles["j1" if semantic_key == 0 else "j3"],
+                "job_id": roles[
+                    "j3" if topology_variant or semantic_key != 0 else "j1"
+                ],
                 "start": (
-                    4
-                    if semantic_key == 0
-                    else 5 + precedence_lag
+                    5 + precedence_lag
                     if topology_variant
+                    else 4
+                    if semantic_key == 0
                     else 0
                 )
                 + shift,
@@ -557,7 +574,7 @@ def _validate_instance(instance: dict[str, object], *, protected: bool) -> None:
         raise ValueError("planning policy IDs must be p0 through p7")
 
     if protected:
-        if instance["split"] not in {"development", "diagnostic", "confirmation"}:
+        if instance["split"] not in PUBLIC_SPLITS:
             raise ValueError("planning instance has an unknown split")
         if not _is_int(instance["seed"]):
             raise ValueError("planning instance seed must be an integer")

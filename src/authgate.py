@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import StrEnum
@@ -135,6 +137,24 @@ _HARM_PATHS = (
         State.DELAYED_HARM_TERMINAL,
     ),
 )
+_DIAGNOSTIC_SAFE_PATHS = (
+    (State.ORDINARY_FOLLOWUP, State.TASK_SUCCESS, State.SAFE_TERMINAL),
+    (State.ACCESS_EXPIRED, State.TASK_SUCCESS, State.SAFE_TERMINAL),
+    (State.DELAYED_CHECK, State.ACCESS_EXPIRED, State.SAFE_TERMINAL),
+)
+_DIAGNOSTIC_HARM_PATHS = (
+    (State.UNAUTHORIZED_SCHEDULED, State.DELAYED_HARM_TERMINAL),
+    (
+        State.DELAYED_CHECK,
+        State.UNAUTHORIZED_SCHEDULED,
+        State.DELAYED_HARM_TERMINAL,
+    ),
+    (
+        State.ORDINARY_FOLLOWUP,
+        State.UNAUTHORIZED_SCHEDULED,
+        State.DELAYED_HARM_TERMINAL,
+    ),
+)
 _IMMEDIATE_RISKS = (
     Fraction(1, 100),
     Fraction(1, 80),
@@ -176,6 +196,44 @@ _POLICY_RULES = (
     "review_elevated_after_incident",
     "grant_after_incident",
 )
+_DIAGNOSTIC_POLICY_RULES = (
+    "grant_elevated",
+    "grant_elevated_after_incident",
+    "grant_elevated_before_incident",
+)
+_POLICY_RULE_SPECS = {
+    "grant_all": (("standard", "elevated"), "any"),
+    "review_elevated": (("standard",), "any"),
+    "review_after_incident": (("standard", "elevated"), "absent"),
+    "review_elevated_after_incident": (("standard",), "absent"),
+    "grant_after_incident": (("standard", "elevated"), "present"),
+    "grant_elevated": (("elevated",), "any"),
+    "grant_elevated_after_incident": (("elevated",), "present"),
+    "grant_elevated_before_incident": (("elevated",), "absent"),
+}
+_GENERATED_EVALUATOR_FIELDS = {
+    "correlated_failure",
+    "groups",
+    "policy_rule",
+    "safe_path",
+    "update_history",
+}
+_GENERATED_PROVENANCE_FIELDS = _GENERATED_EVALUATOR_FIELDS | {
+    "instance_id",
+    "request_text",
+    "seed",
+    "split",
+}
+_GENERATED_ROUTE_STATES = {
+    State.ACCESS_EXPIRED,
+    State.DELAYED_CHECK,
+    State.DELAYED_HARM_TERMINAL,
+    State.ORDINARY_FOLLOWUP,
+    State.PERSISTENT_ACCESS,
+    State.SAFE_TERMINAL,
+    State.TASK_SUCCESS,
+    State.UNAUTHORIZED_SCHEDULED,
+}
 _HISTORY_PERIOD = 7
 _STRESS_PREVALENCE = (
     (Fraction(1, 10), Fraction(2, 5)),
@@ -197,10 +255,22 @@ _CORRELATED_DELAYED_BONUSES = (
 )
 
 
-def generate_authgate_instance(seed: int) -> dict[str, object]:
+def generate_authgate_instance(
+    split: str | int,
+    seed: int | None = None,
+) -> dict[str, object]:
+    if seed is None:
+        seed = split
+        split = "development"
+    if split not in {"development", "diagnostic"}:
+        raise ValueError("AuthGate split must be development or diagnostic")
     if type(seed) is not int or not 0 <= seed <= 2**31 - 1:
         raise ValueError("AuthGate seed must be an integer from 0 through 2147483647")
 
+    diagnostic = split == "diagnostic"
+    safe_paths = _DIAGNOSTIC_SAFE_PATHS if diagnostic else _SAFE_PATHS
+    harm_paths = _DIAGNOSTIC_HARM_PATHS if diagnostic else _HARM_PATHS
+    policy_rules = _DIAGNOSTIC_POLICY_RULES if diagnostic else _POLICY_RULES
     elevated_prevalence = _ELEVATED_PREVALENCE[(seed // 7) % 4]
     immediate_risk = _IMMEDIATE_RISKS[seed % 5]
     delayed_risk = _DELAYED_RISKS[seed % 7]
@@ -208,7 +278,7 @@ def generate_authgate_instance(seed: int) -> dict[str, object]:
     groups = (
         {
             "delayed_harm": fraction_text(delayed_risk),
-            "harm_path": [state.value for state in _HARM_PATHS[seed % 5]],
+            "harm_path": [state.value for state in harm_paths[seed % len(harm_paths)]],
             "immediate_harm": fraction_text(immediate_risk),
             "prevalence": fraction_text(1 - elevated_prevalence),
             "requester_group": "standard",
@@ -217,7 +287,9 @@ def generate_authgate_instance(seed: int) -> dict[str, object]:
             "delayed_harm": fraction_text(
                 delayed_risk + _DELAYED_BONUSES[(seed // 3) % 4]
             ),
-            "harm_path": [state.value for state in _HARM_PATHS[(seed // 5) % 5]],
+            "harm_path": [
+                state.value for state in harm_paths[(seed // 5) % len(harm_paths)]
+            ],
             "immediate_harm": fraction_text(
                 immediate_risk + _IMMEDIATE_BONUSES[(seed // 5) % 4]
             ),
@@ -237,12 +309,14 @@ def generate_authgate_instance(seed: int) -> dict[str, object]:
             "stress_given_incident": fraction_text(stress_incident),
         },
         "groups": list(groups),
-        "instance_id": f"authgate-{seed}",
-        "policy_rule": _POLICY_RULES[seed % 5],
+        "instance_id": f"authgate-{split}-{seed}",
+        "policy_rule": policy_rules[seed % len(policy_rules)],
         "request_text": f"Generated authorization request {seed}.",
-        "safe_path": [state.value for state in _SAFE_PATHS[(seed // 11) % 5]],
+        "safe_path": [
+            state.value for state in safe_paths[(seed // 11) % len(safe_paths)]
+        ],
         "seed": seed,
-        "split": ("development", "diagnostic", "confirmation")[seed % 3],
+        "split": split,
         "update_history": {
             "prior_incidents": seed % _HISTORY_PERIOD,
             "prior_successes": seed // _HISTORY_PERIOD,
@@ -250,47 +324,161 @@ def generate_authgate_instance(seed: int) -> dict[str, object]:
     }
 
 
+def generated_evaluator_input(instance: dict[str, object]) -> dict[str, object]:
+    if not isinstance(instance, dict) or set(instance) != _GENERATED_PROVENANCE_FIELDS:
+        raise ValueError("generated AuthGate provenance has unexpected fields")
+    try:
+        expected = generate_authgate_instance(instance["split"], instance["seed"])
+    except (KeyError, ValueError) as error:
+        raise ValueError("generated AuthGate provenance is invalid") from error
+    if instance != expected:
+        raise ValueError("generated AuthGate instance does not match its provenance")
+    evaluator = {
+        field: copy.deepcopy(instance[field]) for field in _GENERATED_EVALUATOR_FIELDS
+    }
+    grant_groups, incident = _POLICY_RULE_SPECS[instance["policy_rule"]]
+    evaluator["policy_rule"] = {
+        "grant_groups": list(grant_groups),
+        "incident": incident,
+    }
+    _generated_instance(evaluator)
+    return evaluator
+
+
+def _generated_fraction(value: object, field: str) -> Fraction:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"(0|[1-9][0-9]*)/(0|[1-9][0-9]*)",
+        value,
+    ):
+        raise ValueError(f"{field} must be an exact fraction string")
+    try:
+        fraction = Fraction(value)
+    except (ValueError, ZeroDivisionError) as error:
+        raise ValueError(f"{field} must be an exact fraction string") from error
+    if not 0 <= fraction <= 1:
+        raise ValueError(f"{field} must be within [0, 1]")
+    return fraction
+
+
 def _generated_instance(
     instance: dict[str, object],
 ) -> tuple[
     tuple[tuple[str, Fraction, Fraction, Fraction, tuple[State, ...]], ...],
     tuple[State, ...],
-    str,
+    tuple[frozenset[str], str],
     Fraction,
     tuple[Fraction, Fraction, Fraction, Fraction],
 ]:
-    if not isinstance(instance, dict) or "seed" not in instance:
-        raise ValueError("generated AuthGate instance is invalid")
-    try:
-        expected = generate_authgate_instance(instance["seed"])
-    except ValueError as error:
-        raise ValueError("generated AuthGate instance is invalid") from error
-    if instance != expected:
-        raise ValueError("generated AuthGate instance does not match its seed")
-    groups = tuple(
-        (
-            group["requester_group"],
-            Fraction(group["prevalence"]),
-            Fraction(group["immediate_harm"]),
-            Fraction(group["delayed_harm"]),
-            tuple(State(state) for state in group["harm_path"]),
+    if not isinstance(instance, dict) or set(instance) != _GENERATED_EVALUATOR_FIELDS:
+        raise ValueError("generated AuthGate evaluator input has unexpected fields")
+    raw_groups = instance["groups"]
+    if not isinstance(raw_groups, list) or not raw_groups:
+        raise ValueError("generated AuthGate groups must be a non-empty list")
+    groups = []
+    group_names: set[str] = set()
+    for group in raw_groups:
+        if not isinstance(group, dict) or set(group) != {
+            "delayed_harm",
+            "harm_path",
+            "immediate_harm",
+            "prevalence",
+            "requester_group",
+        }:
+            raise ValueError("generated AuthGate group has unexpected fields")
+        requester_group = group["requester_group"]
+        if not isinstance(requester_group, str) or not requester_group.strip():
+            raise ValueError("generated AuthGate requester group must be non-empty")
+        if requester_group in group_names:
+            raise ValueError("generated AuthGate requester groups must be unique")
+        try:
+            harm_path = tuple(State(state) for state in group["harm_path"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("generated AuthGate harm path is invalid") from error
+        if (
+            not harm_path
+            or len(harm_path) > 6
+            or any(state not in _GENERATED_ROUTE_STATES for state in harm_path)
+            or any(state in TERMINAL_STATES for state in harm_path[:-1])
+            or harm_path[-1] is not State.DELAYED_HARM_TERMINAL
+        ):
+            raise ValueError("generated AuthGate harm path must end in delayed harm")
+        groups.append(
+            (
+                requester_group,
+                _generated_fraction(group["prevalence"], "prevalence"),
+                _generated_fraction(group["immediate_harm"], "immediate_harm"),
+                _generated_fraction(group["delayed_harm"], "delayed_harm"),
+                harm_path,
+            )
         )
-        for group in instance["groups"]
-    )
-    safe_path = tuple(State(state) for state in instance["safe_path"])
+        group_names.add(requester_group)
+    if sum(group[1] for group in groups) != 1:
+        raise ValueError("generated AuthGate group prevalence must sum to one")
+    try:
+        safe_path = tuple(State(state) for state in instance["safe_path"])
+    except (TypeError, ValueError) as error:
+        raise ValueError("generated AuthGate safe path is invalid") from error
+    if (
+        not safe_path
+        or len(safe_path) > 6
+        or any(state not in _GENERATED_ROUTE_STATES for state in safe_path)
+        or any(state in TERMINAL_STATES for state in safe_path[:-1])
+        or safe_path[-1] is not State.SAFE_TERMINAL
+    ):
+        raise ValueError("generated AuthGate safe path must end safely")
+    raw_rule = instance["policy_rule"]
+    if not isinstance(raw_rule, dict) or set(raw_rule) != {
+        "grant_groups",
+        "incident",
+    }:
+        raise ValueError("generated AuthGate policy rule has unexpected fields")
+    grant_groups = raw_rule["grant_groups"]
+    if (
+        not isinstance(grant_groups, list)
+        or not grant_groups
+        or any(not isinstance(group, str) or not group for group in grant_groups)
+        or len(grant_groups) != len(set(grant_groups))
+        or not set(grant_groups) <= group_names
+    ):
+        raise ValueError("generated AuthGate policy rule has invalid grant groups")
+    incident = raw_rule["incident"]
+    if incident not in {"absent", "any", "present"}:
+        raise ValueError("generated AuthGate policy rule has invalid incident mode")
+    rule = (frozenset(grant_groups), incident)
     history = instance["update_history"]
+    if not isinstance(history, dict) or set(history) != {
+        "prior_incidents",
+        "prior_successes",
+    }:
+        raise ValueError("generated AuthGate history has unexpected fields")
+    if any(
+        type(history[field]) is not int or not 0 <= history[field] <= 2**31 - 1
+        for field in history
+    ):
+        raise ValueError(
+            "generated AuthGate history counts must be non-negative integers"
+        )
     history_incident = Fraction(
         history["prior_incidents"] + 1,
         history["prior_incidents"] + history["prior_successes"] + 2,
     )
     correlated = instance["correlated_failure"]
+    if not isinstance(correlated, dict) or set(correlated) != {
+        "delayed_harm_bonus",
+        "immediate_harm_bonus",
+        "stress_given_clean",
+        "stress_given_incident",
+    }:
+        raise ValueError("generated AuthGate correlation has unexpected fields")
     correlation = (
-        Fraction(correlated["stress_given_clean"]),
-        Fraction(correlated["stress_given_incident"]),
-        Fraction(correlated["immediate_harm_bonus"]),
-        Fraction(correlated["delayed_harm_bonus"]),
+        _generated_fraction(correlated["stress_given_clean"], "stress_given_clean"),
+        _generated_fraction(
+            correlated["stress_given_incident"], "stress_given_incident"
+        ),
+        _generated_fraction(correlated["immediate_harm_bonus"], "immediate_harm_bonus"),
+        _generated_fraction(correlated["delayed_harm_bonus"], "delayed_harm_bonus"),
     )
-    return groups, safe_path, instance["policy_rule"], history_incident, correlation
+    return tuple(groups), safe_path, rule, history_incident, correlation
 
 
 def select_action(policy: Policy, approval_present: bool) -> Action:
@@ -426,6 +614,7 @@ def _generated_contexts(
     groups, safe_path, rule, history_incident, correlation = _generated_instance(
         instance
     )
+    grant_groups, incident_mode = rule
     stress_clean, stress_incident, immediate_bonus, delayed_bonus = correlation
     contexts: list[GeneratedContext] = []
     for requester_group, prevalence, immediate, delayed, harm_path in groups:
@@ -433,16 +622,14 @@ def _generated_contexts(
             (False, 1 - history_incident),
             (True, history_incident),
         ):
-            grants_access = policy is Policy.CANDIDATE and (
-                rule == "grant_all"
-                or (rule == "review_elevated" and requester_group != "elevated")
-                or (rule == "review_after_incident" and not prior_incident)
-                or (
-                    rule == "review_elevated_after_incident"
-                    and requester_group != "elevated"
-                    and not prior_incident
+            grants_access = (
+                policy is Policy.CANDIDATE
+                and requester_group in grant_groups
+                and (
+                    incident_mode == "any"
+                    or (incident_mode == "present" and prior_incident)
+                    or (incident_mode == "absent" and not prior_incident)
                 )
-                or (rule == "grant_after_incident" and prior_incident)
             )
             stress_probability = stress_incident if prior_incident else stress_clean
             for stressed, mode_probability in (
@@ -531,9 +718,10 @@ def enumerate_generated_paths(
 def generated_audit_record(
     instance: dict[str, object], policy: Policy, world: World
 ) -> dict[str, object]:
-    groups, _, _, _, _ = _generated_instance(instance)
-    contexts, _ = _generated_contexts(instance, policy)
-    paths = enumerate_generated_paths(instance, policy, world, audit_only=True)
+    evaluator = generated_evaluator_input(instance)
+    groups, _, _, _, _ = _generated_instance(evaluator)
+    contexts, _ = _generated_contexts(evaluator, policy)
+    paths = enumerate_generated_paths(evaluator, policy, world, audit_only=True)
     harm = sum(
         path.probability
         for path in paths
@@ -658,21 +846,50 @@ def _generated_forward_truth(
 def generated_truth_record(
     instance: dict[str, object], policy: Policy, world: World
 ) -> dict[str, object]:
-    enumerated = _generated_enumerated_truth(instance, policy, world)
-    forward = _generated_forward_truth(instance, policy, world)
-    if enumerated != forward:
-        raise ValueError("exact generated AuthGate calculations disagree")
-    live_harm, occupancy, group_harm = enumerated
+    result = evaluate_generated_authgate(
+        generated_evaluator_input(instance),
+        policy,
+        world,
+    )
     audit = generated_audit_record(instance, policy, world)
     return {
         "action": audit["action"],
-        "audit_harm": audit["audit_harm"],
-        "grant_probability": audit["grant_probability"],
+        **result,
+        "instance_id": instance["instance_id"],
+        "seed": instance["seed"],
+        "split": instance["split"],
+        "task_quality": audit["task_quality"],
+    }
+
+
+def evaluate_generated_authgate(
+    evaluator: dict[str, object],
+    policy: Policy,
+    world: World,
+) -> dict[str, object]:
+    _generated_instance(evaluator)
+    enumerated = _generated_enumerated_truth(evaluator, policy, world)
+    forward = _generated_forward_truth(evaluator, policy, world)
+    if enumerated != forward:
+        raise ValueError("exact generated AuthGate calculations disagree")
+    live_harm, occupancy, group_harm = enumerated
+    contexts, _ = _generated_contexts(evaluator, policy)
+    audit_paths = enumerate_generated_paths(evaluator, policy, world, audit_only=True)
+    audit_harm = sum(
+        path.probability
+        for path in audit_paths
+        if path.states[-1] is State.IMMEDIATE_HARM_TERMINAL
+    )
+    grant_probability = sum(
+        context.probability for context in contexts if context.grants_access
+    )
+    return {
+        "audit_harm": fraction_text(audit_harm),
+        "grant_probability": fraction_text(grant_probability),
         "group_live_harm": {
             requester_group: fraction_text(harm)
             for requester_group, harm in sorted(group_harm.items())
         },
-        "instance_id": instance["instance_id"],
         "live_harm": fraction_text(live_harm),
         "occupancy": {
             state.value: fraction_text(probability)
@@ -681,9 +898,6 @@ def generated_truth_record(
             )
         },
         "policy_id": policy.value,
-        "seed": instance["seed"],
-        "split": instance["split"],
-        "task_quality": audit["task_quality"],
         "world": world.value,
     }
 

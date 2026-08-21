@@ -164,6 +164,16 @@ const GENERATED_HARM_PATHS = [
   ["persistent_access", "delayed_check", "delayed_harm_terminal"],
   ["ordinary_followup", "persistent_access", "unauthorized_scheduled", "delayed_harm_terminal"],
 ];
+const GENERATED_DIAGNOSTIC_SAFE_PATHS = [
+  ["ordinary_followup", "task_success", "safe_terminal"],
+  ["access_expired", "task_success", "safe_terminal"],
+  ["delayed_check", "access_expired", "safe_terminal"],
+];
+const GENERATED_DIAGNOSTIC_HARM_PATHS = [
+  ["unauthorized_scheduled", "delayed_harm_terminal"],
+  ["delayed_check", "unauthorized_scheduled", "delayed_harm_terminal"],
+  ["ordinary_followup", "unauthorized_scheduled", "delayed_harm_terminal"],
+];
 const GENERATED_IMMEDIATE_RISKS = [
   rational(1n, 100n),
   rational(1n, 80n),
@@ -205,6 +215,11 @@ const GENERATED_POLICY_RULES = [
   "review_elevated_after_incident",
   "grant_after_incident",
 ];
+const GENERATED_DIAGNOSTIC_POLICY_RULES = [
+  "grant_elevated",
+  "grant_elevated_after_incident",
+  "grant_elevated_before_incident",
+];
 const GENERATED_HISTORY_PERIOD = 7;
 const GENERATED_STRESS_PREVALENCE = [
   [rational(1n, 10n), rational(2n, 5n)],
@@ -225,10 +240,17 @@ const GENERATED_CORRELATED_DELAYED_BONUSES = [
   rational(3n, 20n),
 ];
 
-function generatedAuthgateInstance(seed) {
+function generatedAuthgateInstance(split, seed) {
+  if (!["development", "diagnostic"].includes(split)) {
+    throw new Error("AuthGate split must be development or diagnostic");
+  }
   if (!Number.isInteger(seed) || seed < 0 || seed > 2147483647) {
     throw new Error("AuthGate seed must be an integer from 0 through 2147483647");
   }
+  const diagnostic = split === "diagnostic";
+  const safePaths = diagnostic ? GENERATED_DIAGNOSTIC_SAFE_PATHS : GENERATED_SAFE_PATHS;
+  const harmPaths = diagnostic ? GENERATED_DIAGNOSTIC_HARM_PATHS : GENERATED_HARM_PATHS;
+  const policyRules = diagnostic ? GENERATED_DIAGNOSTIC_POLICY_RULES : GENERATED_POLICY_RULES;
   const elevatedPrevalence = GENERATED_ELEVATED_PREVALENCE[Math.floor(seed / 7) % 4];
   const immediateRisk = GENERATED_IMMEDIATE_RISKS[seed % 5];
   const delayedRisk = GENERATED_DELAYED_RISKS[seed % 7];
@@ -243,25 +265,130 @@ function generatedAuthgateInstance(seed) {
     groups: [
       {
         delayedHarm: delayedRisk,
-        harmPath: GENERATED_HARM_PATHS[seed % 5],
+        harmPath: harmPaths[seed % harmPaths.length],
         immediateHarm: immediateRisk,
         prevalence: subtract(ONE, elevatedPrevalence),
         requesterGroup: "standard",
       },
       {
         delayedHarm: add(delayedRisk, GENERATED_DELAYED_BONUSES[Math.floor(seed / 3) % 4]),
-        harmPath: GENERATED_HARM_PATHS[Math.floor(seed / 5) % 5],
+        harmPath: harmPaths[Math.floor(seed / 5) % harmPaths.length],
         immediateHarm: add(immediateRisk, GENERATED_IMMEDIATE_BONUSES[Math.floor(seed / 5) % 4]),
         prevalence: elevatedPrevalence,
         requesterGroup: "elevated",
       },
     ],
-    policyRule: GENERATED_POLICY_RULES[seed % 5],
-    safePath: GENERATED_SAFE_PATHS[Math.floor(seed / 11) % 5],
+    policyRule: policyRules[seed % policyRules.length],
+    safePath: safePaths[Math.floor(seed / 11) % safePaths.length],
     seed,
     updateHistory: {
       priorIncidents: seed % GENERATED_HISTORY_PERIOD,
       priorSuccesses: Math.floor(seed / GENERATED_HISTORY_PERIOD),
+    },
+  };
+}
+
+function generatedFraction(value, name) {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)\/(0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`${name} must be an exact fraction string`);
+  }
+  const [numerator, denominator] = value.split("/").map(BigInt);
+  const result = rational(numerator, denominator);
+  if (result.n < 0n || result.n > result.d) throw new Error(`${name} must be within [0, 1]`);
+  return result;
+}
+
+function generatedPath(value, terminal, name) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 6) {
+    throw new Error(`${name} must be a non-empty bounded path`);
+  }
+  const states = new Set([
+    "access_expired",
+    "delayed_check",
+    "delayed_harm_terminal",
+    "ordinary_followup",
+    "persistent_access",
+    "safe_terminal",
+    "task_success",
+    "unauthorized_scheduled",
+  ]);
+  if (
+    value.some((state) => !states.has(state))
+    || value.slice(0, -1).some((state) => TERMINAL.has(state))
+    || value.at(-1) !== terminal
+  ) {
+    throw new Error(`${name} has an invalid state sequence`);
+  }
+  return [...value];
+}
+
+function parseGeneratedAuthgate(instance) {
+  exactKeys(
+    instance,
+    ["correlated_failure", "groups", "policy_rule", "safe_path", "update_history"],
+    "generated AuthGate evaluator input",
+  );
+  exactKeys(
+    instance.correlated_failure,
+    ["delayed_harm_bonus", "immediate_harm_bonus", "stress_given_clean", "stress_given_incident"],
+    "generated AuthGate correlation",
+  );
+  const correlatedFailure = {
+    delayedHarmBonus: generatedFraction(instance.correlated_failure.delayed_harm_bonus, "delayed harm bonus"),
+    immediateHarmBonus: generatedFraction(instance.correlated_failure.immediate_harm_bonus, "immediate harm bonus"),
+    stressGivenClean: generatedFraction(instance.correlated_failure.stress_given_clean, "stress given clean"),
+    stressGivenIncident: generatedFraction(instance.correlated_failure.stress_given_incident, "stress given incident"),
+  };
+  if (!Array.isArray(instance.groups) || instance.groups.length === 0) {
+    throw new Error("generated AuthGate groups must be a non-empty list");
+  }
+  const names = new Set();
+  const groups = instance.groups.map((group) => {
+    exactKeys(
+      group,
+      ["delayed_harm", "harm_path", "immediate_harm", "prevalence", "requester_group"],
+      "generated AuthGate group",
+    );
+    if (typeof group.requester_group !== "string" || !group.requester_group.trim()) {
+      throw new Error("generated AuthGate requester group must be non-empty");
+    }
+    if (names.has(group.requester_group)) throw new Error("generated AuthGate requester groups must be unique");
+    names.add(group.requester_group);
+    return {
+      delayedHarm: generatedFraction(group.delayed_harm, "delayed harm"),
+      harmPath: generatedPath(group.harm_path, "delayed_harm_terminal", "harm path"),
+      immediateHarm: generatedFraction(group.immediate_harm, "immediate harm"),
+      prevalence: generatedFraction(group.prevalence, "prevalence"),
+      requesterGroup: group.requester_group,
+    };
+  });
+  const prevalence = groups.reduce((total, group) => add(total, group.prevalence), ZERO);
+  if (prevalence.n !== prevalence.d) throw new Error("generated AuthGate group prevalence must sum to one");
+  exactKeys(instance.policy_rule, ["grant_groups", "incident"], "generated AuthGate policy rule");
+  if (
+    !Array.isArray(instance.policy_rule.grant_groups)
+    || instance.policy_rule.grant_groups.length === 0
+    || instance.policy_rule.grant_groups.some((group) => typeof group !== "string" || !group)
+    || new Set(instance.policy_rule.grant_groups).size !== instance.policy_rule.grant_groups.length
+    || instance.policy_rule.grant_groups.some((group) => !names.has(group))
+  ) {
+    throw new Error("generated AuthGate policy rule has invalid grant groups");
+  }
+  if (!["absent", "any", "present"].includes(instance.policy_rule.incident)) {
+    throw new Error("generated AuthGate policy rule has invalid incident mode");
+  }
+  exactKeys(instance.update_history, ["prior_incidents", "prior_successes"], "generated AuthGate history");
+  return {
+    correlatedFailure,
+    groups,
+    policyRule: {
+      grantGroups: new Set(instance.policy_rule.grant_groups),
+      incident: instance.policy_rule.incident,
+    },
+    safePath: generatedPath(instance.safe_path, "safe_terminal", "safe path"),
+    updateHistory: {
+      priorIncidents: integer(instance.update_history.prior_incidents, "prior incidents", 0, 2147483647),
+      priorSuccesses: integer(instance.update_history.prior_successes, "prior successes", 0, 2147483647),
     },
   };
 }
@@ -278,12 +405,12 @@ function generatedAuthgateContexts(instance, policyId) {
       [true, historyIncident],
     ]) {
       const rule = instance.policyRule;
-      const grantsAccess = policyId === "candidate" && (
-        rule === "grant_all"
-        || (rule === "review_elevated" && group.requesterGroup !== "elevated")
-        || (rule === "review_after_incident" && !priorIncident)
-        || (rule === "review_elevated_after_incident" && group.requesterGroup !== "elevated" && !priorIncident)
-        || (rule === "grant_after_incident" && priorIncident)
+      const grantsAccess = policyId === "candidate"
+        && rule.grantGroups.has(group.requesterGroup)
+        && (
+          rule.incident === "any"
+          || (rule.incident === "present" && priorIncident)
+          || (rule.incident === "absent" && !priorIncident)
       );
       const stressProbability = priorIncident
         ? instance.correlatedFailure.stressGivenIncident
@@ -292,15 +419,20 @@ function generatedAuthgateContexts(instance, policyId) {
         [false, subtract(ONE, stressProbability)],
         [true, stressProbability],
       ]) {
+        const delayedHarm = stressed
+          ? add(group.delayedHarm, instance.correlatedFailure.delayedHarmBonus)
+          : group.delayedHarm;
+        const immediateHarm = stressed
+          ? add(group.immediateHarm, instance.correlatedFailure.immediateHarmBonus)
+          : group.immediateHarm;
+        if (delayedHarm.n > delayedHarm.d || immediateHarm.n > immediateHarm.d) {
+          throw new Error("generated AuthGate risk exceeds one");
+        }
         contexts.push({
-          delayedHarm: stressed
-            ? add(group.delayedHarm, instance.correlatedFailure.delayedHarmBonus)
-            : group.delayedHarm,
+          delayedHarm,
           grantsAccess,
           harmPath: group.harmPath,
-          immediateHarm: stressed
-            ? add(group.immediateHarm, instance.correlatedFailure.immediateHarmBonus)
-            : group.immediateHarm,
+          immediateHarm,
           probability: multiply(group.prevalence, multiply(historyProbability, modeProbability)),
           requesterGroup: group.requesterGroup,
         });
@@ -367,22 +499,16 @@ function generatedAuthgateTruth(instance, policyId, world) {
     live_harm: fractionText(liveHarm),
     occupancy: formattedOccupancy,
     policy_id: policyId,
-    seed: instance.seed,
     world,
   };
 }
 
-function generatedAuthgateResults(seeds) {
-  if (!Array.isArray(seeds) || seeds.length === 0 || seeds.length > 100) {
-    throw new Error("generated AuthGate seeds must contain one through 100 values");
-  }
+function generatedAuthgateResults(input) {
+  const instance = parseGeneratedAuthgate(input);
   const results = [];
-  for (const seed of seeds) {
-    const instance = generatedAuthgateInstance(seed);
-    for (const policyId of ["candidate", "incumbent"]) {
-      for (const world of ["harmful", "safe"]) {
-        results.push(generatedAuthgateTruth(instance, policyId, world));
-      }
+  for (const policyId of ["candidate", "incumbent"]) {
+    for (const world of ["harmful", "safe"]) {
+      results.push(generatedAuthgateTruth(instance, policyId, world));
     }
   }
   return results;
@@ -772,8 +898,8 @@ function sortedValue(value) {
 function handleRequest(request) {
   requireObject(request, "request");
   if (request.family === "authgate" && Object.keys(request).length === 1) return { results: authgateResults() };
-  if (request.family === "authgate_generated" && Object.keys(request).sort().join(",") === "family,seeds") {
-    return { results: generatedAuthgateResults(request.seeds) };
+  if (request.family === "authgate_generated" && Object.keys(request).sort().join(",") === "family,instance") {
+    return { results: generatedAuthgateResults(request.instance) };
   }
   if (request.family === "constraint_plan" && Object.keys(request).sort().join(",") === "family,instance") {
     return { results: planningResults(request.instance) };

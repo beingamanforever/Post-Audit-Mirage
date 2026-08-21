@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from contextlib import contextmanager
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,18 +28,30 @@ from src.authgate import (
     audit_record,
     enumerate_generated_paths,
     enumerate_paths,
+    evaluate_generated_authgate,
     generate_authgate_instance,
     generated_audit_record,
+    generated_evaluator_input,
     generated_truth_record,
     reachable_states,
 )
-from src.dataset import build_dataset, canonical_json_bytes
 from src.constraint_plan import (
     MAX_ASSIGNMENTS,
     evaluate_all,
     evaluator_input,
     generate_instances,
     load_templates,
+)
+from src.dataset import (
+    build_dataset,
+    canonical_json_bytes,
+    load_templates as load_auth_templates,
+)
+from src.decision_methods import (
+    ComponentEvidence,
+    PaceReset,
+    SgmTransferred,
+    UpdateEvidence,
 )
 from src.environment_validation import build_planning
 from src.surface_generation import MODEL, RETURNED_MODELS
@@ -193,8 +206,8 @@ class ProjectEndToEndTest(unittest.TestCase):
             audits = read_jsonl(dataset_path / "audit.jsonl")
             truths = read_jsonl(dataset_path / "truth.jsonl")
 
-            self.assertEqual((len(surfaces), len(audits), len(truths)), (36, 72, 144))
-            self.assertEqual(len(requests), 12)
+            self.assertEqual((len(surfaces), len(audits), len(truths)), (30, 60, 120))
+            self.assertEqual(len(requests), 10)
             for request in requests:
                 self.assertEqual(request["model"], MODEL)
                 self.assertNotIn("temperature", request)
@@ -420,6 +433,263 @@ class ProjectEndToEndTest(unittest.TestCase):
             self.assertEqual((output / "audit.jsonl").read_bytes(), AUDIT.read_bytes())
             self.assertEqual((output / "truth.jsonl").read_bytes(), TRUTH.read_bytes())
 
+    def test_structural_splits_are_isolated(self) -> None:
+        public_splits = {"development", "diagnostic"}
+        artifact_paths = (
+            TEMPLATES,
+            SURFACES,
+            AUDIT,
+            TRUTH,
+            PLANNING_TEMPLATES,
+            PLANNING_PROPOSER,
+            PLANNING_AUDIT,
+            PLANNING_TRUTH,
+        )
+        for path in artifact_paths:
+            self.assertNotIn("confirmation", path.read_text(encoding="utf-8"))
+
+        auth_templates = load_auth_templates(TEMPLATES)
+        planning_templates = load_templates(PLANNING_TEMPLATES)
+        self.assertEqual({row["split"] for row in auth_templates}, {"development"})
+        self.assertEqual({row["split"] for row in planning_templates}, public_splits)
+        for rows, parent_field in (
+            (read_jsonl(SURFACES), "template_id"),
+            (read_jsonl(AUDIT), "template_id"),
+            (read_jsonl(TRUTH), "template_id"),
+            (read_jsonl(PLANNING_TRUTH), "instance_id"),
+        ):
+            splits_by_parent: dict[object, set[object]] = {}
+            for row in rows:
+                splits_by_parent.setdefault(row[parent_field], set()).add(row["split"])
+            self.assertTrue(
+                all(len(splits) == 1 for splits in splits_by_parent.values())
+            )
+
+        def rejected_templates(
+            loader: Callable[[Path], list[dict[str, object]]],
+            rows: list[dict[str, object]],
+            candidate: dict[str, object],
+            message: str,
+        ) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "templates.json"
+                path.write_text(
+                    json.dumps([*rows, candidate], indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    loader(path)
+
+        auth_diagnostic = [dict(template) for template in auth_templates]
+        auth_diagnostic[0]["split"] = "diagnostic"
+        rejected_templates(
+            load_auth_templates,
+            auth_diagnostic[:-1],
+            auth_diagnostic[-1],
+            "fixed AuthGate templates must be development only",
+        )
+
+        plan_parent = dict(planning_templates[0])
+        plan_parent["split"] = "diagnostic"
+        rejected_templates(
+            load_templates,
+            planning_templates,
+            plan_parent,
+            "structure_mode spans structural splits",
+        )
+        plan_exact = dict(plan_parent, template_id="plan_renamed")
+        rejected_templates(
+            load_templates,
+            planning_templates,
+            plan_exact,
+            "structure_mode spans structural splits",
+        )
+        plan_far = dict(
+            plan_exact,
+            overfit_start=7,
+            structure_job_id="j3",
+            structure_start=0,
+        )
+        rejected_templates(
+            load_templates,
+            planning_templates,
+            plan_far,
+            "structure_mode spans structural splits",
+        )
+
+        for split in public_splits:
+            generated = [generate_authgate_instance(split, seed) for seed in (11, 29)]
+            self.assertEqual({instance["split"] for instance in generated}, {split})
+        for seed in (11, 29):
+            development = generate_authgate_instance("development", seed)
+            diagnostic = generate_authgate_instance("diagnostic", seed)
+            development_descriptor = (
+                development["policy_rule"],
+                development["safe_path"],
+                [group["harm_path"] for group in development["groups"]],
+            )
+            diagnostic_descriptor = (
+                diagnostic["policy_rule"],
+                diagnostic["safe_path"],
+                [group["harm_path"] for group in diagnostic["groups"]],
+            )
+            self.assertTrue(
+                all(
+                    left != right
+                    for left, right in zip(
+                        development_descriptor,
+                        diagnostic_descriptor,
+                        strict=True,
+                    )
+                )
+            )
+        diagnostic = [
+            generate_authgate_instance("diagnostic", seed) for seed in (0, 11, 22)
+        ]
+        self.assertEqual(
+            {instance["policy_rule"] for instance in diagnostic},
+            {
+                "grant_elevated",
+                "grant_elevated_after_incident",
+                "grant_elevated_before_incident",
+            },
+        )
+        self.assertEqual(
+            {tuple(instance["safe_path"]) for instance in diagnostic},
+            {
+                tuple(path)
+                for path in (
+                    ["ordinary_followup", "task_success", "safe_terminal"],
+                    ["access_expired", "task_success", "safe_terminal"],
+                    ["delayed_check", "access_expired", "safe_terminal"],
+                )
+            },
+        )
+
+        for seed in (11, 29):
+            generated = generate_instances(
+                planning_templates,
+                seed=seed,
+                instances_per_template=2,
+            )
+            split_by_parent = {
+                str(template["template_id"]): str(template["split"])
+                for template in planning_templates
+            }
+            self.assertTrue(
+                all(
+                    instance["split"] == split_by_parent[instance["template_id"]]
+                    for instance in generated
+                )
+            )
+            mode_by_parent = {
+                str(template["template_id"]): str(template["structure_mode"])
+                for template in planning_templates
+            }
+            self.assertTrue(
+                all(
+                    len(instance["precedence"])
+                    == (2 if mode_by_parent[instance["template_id"]] == "branch" else 1)
+                    for instance in generated
+                )
+            )
+
+        external = generated_evaluator_input(
+            generate_authgate_instance("diagnostic", 22)
+        )
+        named_rules = {
+            canonical_json_bytes(
+                generated_evaluator_input(generate_authgate_instance(split, seed))[
+                    "policy_rule"
+                ]
+            )
+            for split, seeds in (
+                ("development", range(5)),
+                ("diagnostic", range(3)),
+            )
+            for seed in seeds
+        }
+        external["correlated_failure"]["stress_given_clean"] = "7/20"
+        external["policy_rule"] = {
+            "grant_groups": ["standard"],
+            "incident": "present",
+        }
+        self.assertNotIn(canonical_json_bytes(external["policy_rule"]), named_rules)
+        self.assertTrue(
+            {"instance_id", "request_text", "seed", "split"}.isdisjoint(external)
+        )
+        python_rows = [
+            evaluate_generated_authgate(external, policy, world)
+            for policy in Policy
+            for world in (World.HARMFUL, World.SAFE)
+        ]
+        node = subprocess.run(
+            ["node", str(NODE_EVALUATOR)],
+            input=json.dumps({"family": "authgate_generated", "instance": external}),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(node.returncode, 0, node.stderr)
+        self.assertEqual(
+            canonical_json_bytes({"rows": python_rows}),
+            canonical_json_bytes({"rows": json.loads(node.stdout)["results"]}),
+        )
+        invalid = copy.deepcopy(external)
+        invalid["groups"][0]["prevalence"] = "1"
+        with self.assertRaisesRegex(ValueError, "exact fraction string"):
+            evaluate_generated_authgate(invalid, Policy.CANDIDATE, World.HARMFUL)
+        rejected = subprocess.run(
+            ["node", str(NODE_EVALUATOR)],
+            input=json.dumps({"family": "authgate_generated", "instance": invalid}),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("exact fraction string", rejected.stderr)
+
+        invalid_rule = copy.deepcopy(external)
+        invalid_rule["policy_rule"]["grant_groups"] = ["unknown"]
+        with self.assertRaisesRegex(ValueError, "invalid grant groups"):
+            evaluate_generated_authgate(
+                invalid_rule,
+                Policy.CANDIDATE,
+                World.HARMFUL,
+            )
+        rejected = subprocess.run(
+            ["node", str(NODE_EVALUATOR)],
+            input=json.dumps(
+                {"family": "authgate_generated", "instance": invalid_rule}
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("invalid grant groups", rejected.stderr)
+
+        whitespace_group = copy.deepcopy(external)
+        whitespace_group["groups"][0]["requester_group"] = " "
+        whitespace_group["policy_rule"]["grant_groups"] = [" "]
+        with self.assertRaisesRegex(ValueError, "requester group must be non-empty"):
+            evaluate_generated_authgate(
+                whitespace_group,
+                Policy.CANDIDATE,
+                World.HARMFUL,
+            )
+        rejected = subprocess.run(
+            ["node", str(NODE_EVALUATOR)],
+            input=json.dumps(
+                {"family": "authgate_generated", "instance": whitespace_group}
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("requester group must be non-empty", rejected.stderr)
+
     def test_authgate_procedural_semantics_end_to_end(self) -> None:
         validated = self.run_cli(
             "validate-environments",
@@ -431,7 +701,11 @@ class ProjectEndToEndTest(unittest.TestCase):
         self.assertEqual(validated.returncode, 0, validated.stderr)
 
         seeds = (11, 29, 47)
-        instances = [generate_authgate_instance(seed) for seed in seeds]
+        instances = [generate_authgate_instance("development", seed) for seed in seeds]
+        self.assertEqual(
+            instances,
+            [generate_authgate_instance("development", seed) for seed in seeds],
+        )
         self.assertEqual(
             instances, [generate_authgate_instance(seed) for seed in seeds]
         )
@@ -527,7 +801,11 @@ class ProjectEndToEndTest(unittest.TestCase):
             self.assertEqual(
                 harmful["occupancy"]["safe_terminal"], anchor["safe_terminal"]
             )
-            paths = enumerate_generated_paths(instance, Policy.CANDIDATE, World.HARMFUL)
+            paths = enumerate_generated_paths(
+                generated_evaluator_input(instance),
+                Policy.CANDIDATE,
+                World.HARMFUL,
+            )
             self.assertEqual(max(len(path.states) - 1 for path in paths), 8)
             self.assertTrue(all(len(path.states) - 1 <= HORIZON for path in paths))
 
@@ -607,7 +885,7 @@ class ProjectEndToEndTest(unittest.TestCase):
         from src import authgate as authgate_module
 
         seed = 11
-        baseline_instance = generate_authgate_instance(seed)
+        baseline_instance = generate_authgate_instance("development", seed)
         baseline_audit = generated_audit_record(
             baseline_instance, Policy.CANDIDATE, World.SAFE
         )
@@ -633,7 +911,7 @@ class ProjectEndToEndTest(unittest.TestCase):
                 self.subTest(axis=name),
                 patch.object(authgate_module, name, replace(values, index, value)),
             ):
-                changed_instance = generate_authgate_instance(seed)
+                changed_instance = generate_authgate_instance("development", seed)
                 changed_truth = generated_truth_record(
                     changed_instance, Policy.CANDIDATE, World.HARMFUL
                 )
@@ -651,7 +929,7 @@ class ProjectEndToEndTest(unittest.TestCase):
                     )
 
         with patch.object(authgate_module, "_HISTORY_PERIOD", 5):
-            changed_instance = generate_authgate_instance(seed)
+            changed_instance = generate_authgate_instance("development", seed)
             changed_truth = generated_truth_record(
                 changed_instance, Policy.CANDIDATE, World.HARMFUL
             )
@@ -865,6 +1143,36 @@ class ProjectEndToEndTest(unittest.TestCase):
                 self.assertEqual(len(exact_results), len(siblings))
 
         generated = [instance for panel in panels.values() for instance in panel]
+        branch = [
+            instance for instance in generated if instance["template_id"] == "plan_a"
+        ]
+        chain = [
+            instance for instance in generated if instance["template_id"] == "plan_b"
+        ]
+        self.assertEqual(
+            {job["duration"] for instance in branch for job in instance["jobs"]},
+            {1, 2},
+        )
+        self.assertEqual(
+            {
+                cooldown["duration"]
+                for instance in branch
+                for cooldown in instance["cooldowns"]
+            },
+            {1, 2},
+        )
+        self.assertEqual(
+            {job["duration"] for instance in chain for job in instance["jobs"]},
+            {1, 2, 3},
+        )
+        self.assertEqual(
+            {
+                cooldown["duration"]
+                for instance in chain
+                for cooldown in instance["cooldowns"]
+            },
+            {1, 2, 3},
+        )
         self.assertEqual(
             {job["duration"] for instance in generated for job in instance["jobs"]},
             {1, 2, 3},
@@ -1049,7 +1357,7 @@ class ProjectEndToEndTest(unittest.TestCase):
         mutations.append(("job deadline", changed))
 
         changed = copy.deepcopy(baseline)
-        changed["precedence"].append({"after": "j3", "before": "j1", "lag": 0})
+        changed["precedence"] = changed["precedence"][:1]
         mutations.append(("precedence topology", changed))
 
         changed = copy.deepcopy(baseline)
@@ -1239,7 +1547,7 @@ class ProjectEndToEndTest(unittest.TestCase):
             proposer = read_jsonl(output / "planning_proposer.jsonl")
             audits = read_jsonl(output / "planning_audit.jsonl")
             truths = read_jsonl(output / "planning_truth.jsonl")
-            self.assertEqual((len(proposer), len(audits), len(truths)), (6, 48, 96))
+            self.assertEqual((len(proposer), len(audits), len(truths)), (4, 32, 64))
             self.assertEqual(
                 (output / "planning_proposer.jsonl").read_bytes(),
                 PLANNING_PROPOSER.read_bytes(),
@@ -1286,7 +1594,7 @@ class ProjectEndToEndTest(unittest.TestCase):
                 categories_by_split.setdefault(row["split"], set()).add(row["category"])
             self.assertEqual(
                 set(categories_by_split),
-                {"development", "diagnostic", "confirmation"},
+                {"development", "diagnostic"},
             )
             self.assertTrue(
                 all(
@@ -1364,7 +1672,7 @@ class ProjectEndToEndTest(unittest.TestCase):
             root = Path(directory)
             templates = root / "planning_templates.json"
             rows = json.loads(PLANNING_TEMPLATES.read_text(encoding="utf-8"))
-            rows[0]["overfit_start"] = 3
+            rows[1]["overfit_start"] = 3
             templates.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
             output = root / "output"
             output.mkdir()
@@ -1480,10 +1788,45 @@ class ProjectEndToEndTest(unittest.TestCase):
         transferred = harmful_by_key[("constraint_plan_v0", "p6", "sgm_transferred")]
         reset = harmful_by_key[("constraint_plan_v0", "p6", "pace_reset")]
         closed = harmful_by_key[("constraint_plan_v0", "p6", "online_closed_e")]
-        self.assertTrue(transferred["deploy"])
+        self.assertFalse(transferred["deploy"])
         self.assertFalse(reset["deploy"])
         self.assertFalse(closed["deploy"])
+        self.assertGreater(transferred["statistic"], reset["statistic"])
         self.assertIn("known-bad", transferred["reason"])
+
+        crossed_then_fell = UpdateEvidence(
+            family="test",
+            update_id="pace-first-crossing",
+            components=(ComponentEvidence("margin", (1.0,)),),
+            pace_outcomes=(1, 1, 1, 1, 0),
+        )
+        pace = PaceReset(alpha=0.2)
+        crossing = pace.decide(crossed_then_fell)
+        self.assertTrue(crossing.deploy)
+        self.assertEqual(crossing.statistic, 5.0625)
+        self.assertEqual(crossing.reason, "per-update PACE first crossing")
+
+        transferred_control = SgmTransferred()
+        reset_control = PaceReset()
+        transferred_decisions = []
+        reset_decisions = []
+        for index in range(2):
+            update = UpdateEvidence(
+                family="test",
+                update_id=f"independent-{index}",
+                components=(ComponentEvidence("margin", (1.0,) * 4),),
+                pace_outcomes=(1, 1, 1, 1),
+            )
+            transferred_decisions.append(transferred_control.decide(update))
+            reset_decisions.append(reset_control.decide(update))
+        self.assertEqual(
+            [decision.deploy for decision in transferred_decisions],
+            [False, True],
+        )
+        self.assertEqual(
+            [decision.deploy for decision in reset_decisions],
+            [False, False],
+        )
 
         repeated = self.run_cli(
             "run-methods",

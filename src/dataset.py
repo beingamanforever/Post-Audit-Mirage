@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
 from .authgate import (
@@ -56,28 +56,25 @@ def canonical_json_bytes(row: dict[str, object]) -> bytes:
 def load_templates(path: Path) -> list[dict[str, object]]:
     with path.open(encoding="utf-8") as source:
         templates = json.load(source)
-    if not isinstance(templates, list) or len(templates) != 12:
-        raise ValueError("templates.json must contain twelve templates")
+    if not isinstance(templates, list) or not templates:
+        raise ValueError("templates.json must contain templates")
 
-    template_ids: set[str] = set()
     for template in templates:
         if not isinstance(template, dict) or set(template) != TEMPLATE_FIELDS:
             raise ValueError("template has unexpected fields")
         template_id = template["template_id"]
-        if not isinstance(template_id, str) or template_id in template_ids:
-            raise ValueError("template IDs must be unique strings")
+        if not isinstance(template_id, str) or not template_id:
+            raise ValueError("template IDs must be non-empty strings")
         if not isinstance(template["approval_present"], bool):
             raise ValueError("approval_present must be boolean")
         for field in TEMPLATE_FIELDS - {"approval_present"}:
             if not isinstance(template[field], str) or not template[field]:
                 raise ValueError(f"template {field} must be a non-empty string")
-        template_ids.add(template_id)
-
-    split_counts = Counter(str(template["split"]) for template in templates)
-    if split_counts != {"development": 8, "diagnostic": 2, "confirmation": 2}:
-        raise ValueError(
-            "template splits must be 8 development, 2 diagnostic, and 2 confirmation"
-        )
+    if {str(template["split"]) for template in templates} != {"development"}:
+        raise ValueError("fixed AuthGate templates must be development only")
+    template_ids = [str(template["template_id"]) for template in templates]
+    if len(template_ids) != len(set(template_ids)):
+        raise ValueError("template IDs must be unique strings")
     return sorted(templates, key=lambda item: str(item["template_id"]))
 
 
@@ -97,8 +94,9 @@ def load_surfaces(
             if not isinstance(row, dict) or set(row) != SURFACE_FIELDS:
                 raise ValueError(f"surface row {line_number} has unexpected fields")
             rows.append(row)
-    if len(rows) != 36:
-        raise ValueError("surface_variants.jsonl must contain 36 rows")
+    expected_rows = 3 * len(templates)
+    if len(rows) != expected_rows:
+        raise ValueError(f"surface_variants.jsonl must contain {expected_rows} rows")
 
     templates_by_id = {str(item["template_id"]): item for item in templates}
     variants_by_template: defaultdict[str, set[str]] = defaultdict(set)
@@ -281,7 +279,7 @@ def build_dataset(
             for world in World:
                 truth_rows.append(truth_record(case, policy, world))
 
-    if len(audit_rows) != 72 or len(truth_rows) != 144:
+    if len(audit_rows) != 2 * len(surfaces) or len(truth_rows) != 4 * len(surfaces):
         raise ValueError("AuthGate-v0 produced an unexpected number of rows")
     _publish_dataset(output_dir, audit_rows, truth_rows)
     return len(audit_rows), len(truth_rows)

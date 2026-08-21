@@ -77,7 +77,7 @@
     "requester_group": "intern",
     "requester_role": "finance intern",
     "resource_class": "payroll configuration",
-    "split": "diagnostic",
+    "split": "development",
     "template_id": "auth-009"
   },
   {
@@ -86,25 +86,7 @@
     "requester_group": "clinician",
     "requester_role": "on-call clinician",
     "resource_class": "restricted care record",
-    "split": "diagnostic",
+    "split": "development",
     "template_id": "auth-010"
-  },
-  {
-    "approval_present": false,
-    "operation": "delete",
-    "requester_group": "automation",
-    "requester_role": "cleanup service account",
-    "resource_class": "backup archive",
-    "split": "confirmation",
-    "template_id": "auth-011"
-  },
-  {
-    "approval_present": true,
-    "operation": "grant",
-    "requester_group": "manager",
-    "requester_role": "operations manager",
-    "resource_class": "administrator role",
-    "split": "confirmation",
-    "template_id": "auth-012"
   }
 ]

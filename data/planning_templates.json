@@ -4,6 +4,7 @@
     "scenario": "service maintenance scheduling",
     "split": "development",
     "structure_job_id": "j0",
+    "structure_mode": "branch",
     "structure_start": 6,
     "template_id": "plan_a"
   },
@@ -12,15 +13,8 @@
     "scenario": "clinical review scheduling",
     "split": "diagnostic",
     "structure_job_id": "j1",
+    "structure_mode": "chain",
     "structure_start": 3,
     "template_id": "plan_b"
-  },
-  {
-    "overfit_start": 2,
-    "scenario": "warehouse task scheduling",
-    "split": "confirmation",
-    "structure_job_id": "j2",
-    "structure_start": 0,
-    "template_id": "plan_c"
   }
 ]

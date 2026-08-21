@@ -257,15 +257,18 @@ class PaceReset:
         update: UpdateEvidence,
         monitor: MonitorEvidence | None = None,
     ) -> Decision:
-        wealth = math.prod(
-            1 + self.bet * (2 * outcome - 1) for outcome in update.pace_outcomes
-        )
-        return Decision(
-            bool(update.pace_outcomes) and wealth >= 1 / self.alpha,
-            wealth,
-            1 / self.alpha,
-            "per-update PACE wealth reset",
-        )
+        threshold = 1 / self.alpha
+        wealth = 1.0
+        for outcome in update.pace_outcomes:
+            wealth *= 1 + self.bet * (2 * outcome - 1)
+            if wealth >= threshold:
+                return Decision(
+                    True,
+                    wealth,
+                    threshold,
+                    "per-update PACE first crossing",
+                )
+        return Decision(False, wealth, threshold, "per-update PACE wealth reset")
 
 
 class ReusedHoldout:

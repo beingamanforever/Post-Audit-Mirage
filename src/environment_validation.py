@@ -9,9 +9,10 @@ from .authgate import (
     Case,
     Policy,
     World,
+    evaluate_generated_authgate,
     generate_authgate_instance,
     generated_audit_record,
-    generated_truth_record,
+    generated_evaluator_input,
     truth_record,
 )
 from .constraint_plan import (
@@ -25,7 +26,10 @@ from .constraint_plan import (
 from .dataset import canonical_json_bytes, publish_rows
 
 NODE_EVALUATOR = Path(__file__).with_name("exact_evaluator.js")
-AUTHGATE_SEEDS = (11, 29, 47)
+AUTHGATE_SEEDS_BY_SPLIT = {
+    "development": (11, 29, 47),
+    "diagnostic": (0, 11, 22),
+}
 
 
 def _node(request: dict[str, object], path: Path) -> list[dict[str, object]]:
@@ -81,29 +85,13 @@ def _authgate_results() -> list[dict[str, object]]:
     return rows
 
 
-def _generated_authgate_results(seeds: tuple[int, ...]) -> list[dict[str, object]]:
+def _generated_authgate_results(
+    evaluator: dict[str, object],
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    for seed in seeds:
-        instance = generate_authgate_instance(seed)
-        for policy in Policy:
-            safe_audit = generated_audit_record(instance, policy, World.SAFE)
-            harmful_audit = generated_audit_record(instance, policy, World.HARMFUL)
-            if canonical_json_bytes(safe_audit) != canonical_json_bytes(harmful_audit):
-                raise ValueError(f"generated AuthGate audits differ for seed {seed}")
-            for world in (World.HARMFUL, World.SAFE):
-                truth = generated_truth_record(instance, policy, world)
-                rows.append(
-                    {
-                        "audit_harm": truth["audit_harm"],
-                        "grant_probability": truth["grant_probability"],
-                        "group_live_harm": truth["group_live_harm"],
-                        "live_harm": truth["live_harm"],
-                        "occupancy": truth["occupancy"],
-                        "policy_id": policy.value,
-                        "seed": seed,
-                        "world": world.value,
-                    }
-                )
+    for policy in Policy:
+        for world in (World.HARMFUL, World.SAFE):
+            rows.append(evaluate_generated_authgate(evaluator, policy, world))
     return rows
 
 
@@ -114,14 +102,39 @@ def _validate_authgate(node_path: Path) -> None:
         {"rows": node_rows}
     ):
         raise ValueError("Python and Node AuthGate evaluators disagree")
-    generated_python_rows = _generated_authgate_results(AUTHGATE_SEEDS)
-    generated_node_rows = _node(
-        {"family": "authgate_generated", "seeds": list(AUTHGATE_SEEDS)}, node_path
-    )
-    if canonical_json_bytes({"rows": generated_python_rows}) != canonical_json_bytes(
-        {"rows": generated_node_rows}
-    ):
-        raise ValueError("Python and Node generated AuthGate evaluators disagree")
+    diagnostic_axes = (set(), set(), set(), set())
+    for split, seeds in AUTHGATE_SEEDS_BY_SPLIT.items():
+        for seed in seeds:
+            instance = generate_authgate_instance(split, seed)
+            evaluator = generated_evaluator_input(instance)
+            for policy in Policy:
+                safe_audit = generated_audit_record(instance, policy, World.SAFE)
+                harmful_audit = generated_audit_record(instance, policy, World.HARMFUL)
+                if canonical_json_bytes(safe_audit) != canonical_json_bytes(
+                    harmful_audit
+                ):
+                    raise ValueError(
+                        f"generated AuthGate audits differ for {split} seed {seed}"
+                    )
+            generated_python_rows = _generated_authgate_results(evaluator)
+            generated_node_rows = _node(
+                {"family": "authgate_generated", "instance": evaluator},
+                node_path,
+            )
+            if canonical_json_bytes(
+                {"rows": generated_python_rows}
+            ) != canonical_json_bytes({"rows": generated_node_rows}):
+                raise ValueError(
+                    "Python and Node generated AuthGate evaluators disagree "
+                    f"for {split} seed {seed}"
+                )
+            if split == "diagnostic":
+                diagnostic_axes[0].add(canonical_json_bytes(evaluator["policy_rule"]))
+                diagnostic_axes[1].add(tuple(evaluator["safe_path"]))
+                diagnostic_axes[2].add(tuple(evaluator["groups"][0]["harm_path"]))
+                diagnostic_axes[3].add(tuple(evaluator["groups"][1]["harm_path"]))
+    if any(len(values) != 3 for values in diagnostic_axes):
+        raise ValueError("generated AuthGate diagnostic parity panel is incomplete")
 
 
 def _result(
