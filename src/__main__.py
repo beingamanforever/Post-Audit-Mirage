@@ -20,6 +20,7 @@ from .surface_generation import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
+ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -76,6 +77,7 @@ def _parser() -> argparse.ArgumentParser:
     experiments = commands.add_parser("run-experiments")
     experiments.add_argument("--data-dir", type=Path, default=DATA_DIR)
     experiments.add_argument("--output-dir", type=Path, default=DATA_DIR)
+    experiments.add_argument("--artifacts-dir", type=Path, default=ARTIFACTS_DIR)
     experiments.add_argument("--replications", type=int, default=500)
     experiments.add_argument("--seed", type=int, default=20260821)
     experiments.add_argument("--alpha", type=float, default=0.05)
@@ -137,6 +139,7 @@ def main() -> int:
         if arguments.command == "run-experiments":
             summary = run_experiments(
                 arguments.output_dir,
+                artifacts_dir=arguments.artifacts_dir,
                 data_dir=arguments.data_dir,
                 replications=arguments.replications,
                 seed=arguments.seed,
@@ -146,7 +149,10 @@ def main() -> int:
                 f"{name}={result['status']}"
                 for name, result in summary["experiments"].items()
             )
-            print(f"wrote Phase 4 results to {arguments.output_dir}: {statuses}")
+            print(
+                f"wrote Phase 4 data to {arguments.output_dir} and plots to "
+                f"{arguments.artifacts_dir}: {statuses}"
+            )
             return 0
         instances, _ = validate_environments(
             arguments.templates,

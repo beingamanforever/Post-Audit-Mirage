@@ -34,6 +34,7 @@ ONE_SIDED_95_Z = 1.6448536269514722
 def run_experiments(
     output_dir: Path,
     *,
+    artifacts_dir: Path | None = None,
     data_dir: Path | None = None,
     replications: int = 500,
     seed: int = 20260821,
@@ -66,14 +67,19 @@ def run_experiments(
             "experiment_4": _restoration_status(restoration),
         },
     }
+    artifacts_dir = artifacts_dir or output_dir
     payloads = {
-        "phase4_results.jsonl": "".join(_json_line(row) for row in rows),
-        "phase4_summary.json": _json_line(summary),
-        "experiment_landscape.svg": landscape_svg(landscape, summary),
-        "experiment_impossibility.svg": impossibility_svg(impossibility, summary),
-        "experiment_restoration.svg": restoration_svg(restoration, summary),
+        output_dir / "phase4_results.jsonl": "".join(_json_line(row) for row in rows),
+        output_dir / "phase4_summary.json": _json_line(summary),
+        artifacts_dir / "experiment_landscape.svg": landscape_svg(landscape, summary),
+        artifacts_dir / "experiment_impossibility.svg": impossibility_svg(
+            impossibility, summary
+        ),
+        artifacts_dir / "experiment_restoration.svg": restoration_svg(
+            restoration, summary
+        ),
     }
-    _publish(output_dir, payloads)
+    _publish(payloads)
     return summary
 
 
@@ -729,25 +735,24 @@ def _fraction(row: dict[str, object], field: str) -> Fraction:
     return value
 
 
-def _publish(output_dir: Path, payloads: dict[str, str]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    staged: dict[str, Path] = {}
+def _publish(payloads: dict[Path, str]) -> None:
+    staged: dict[Path, Path] = {}
     backups: dict[Path, Path] = {}
     published: set[Path] = set()
     try:
-        for filename, payload in payloads.items():
+        for target, payload in payloads.items():
+            target.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{filename}.", dir=output_dir
+                prefix=f".{target.name}.", dir=target.parent
             )
             temporary = Path(temporary_name)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 stream.write(payload)
             os.chmod(temporary, 0o644)
-            staged[filename] = temporary
-        for filename in payloads:
-            target = output_dir / filename
+            staged[target] = temporary
+        for target in payloads:
             if target.exists():
-                descriptor, backup_name = tempfile.mkstemp(dir=output_dir)
+                descriptor, backup_name = tempfile.mkstemp(dir=target.parent)
                 os.close(descriptor)
                 backup = Path(backup_name)
                 try:
@@ -756,8 +761,7 @@ def _publish(output_dir: Path, payloads: dict[str, str]) -> None:
                     backup.unlink(missing_ok=True)
                     raise
                 backups[target] = backup
-        for filename, temporary in staged.items():
-            target = output_dir / filename
+        for target, temporary in staged.items():
             os.replace(temporary, target)
             published.add(target)
     except Exception:

@@ -924,18 +924,31 @@ class ProjectEndToEndTest(unittest.TestCase):
                 )
 
     def test_phase4_experiments_prove_landscape_limit_and_restoration(self) -> None:
-        filenames = {
+        artifact_filenames = {
             "experiment_impossibility.svg",
             "experiment_landscape.svg",
             "experiment_restoration.svg",
+        }
+        data_filenames = {
             "phase4_results.jsonl",
             "phase4_summary.json",
         }
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            run = self.run_cli("run-experiments", "--output-dir", str(output))
+            root = Path(directory)
+            output = root / "data"
+            artifacts = root / "artifacts"
+            run = self.run_cli(
+                "run-experiments",
+                "--output-dir",
+                str(output),
+                "--artifacts-dir",
+                str(artifacts),
+            )
             self.assertEqual(run.returncode, 0, run.stderr)
-            self.assertEqual({path.name for path in output.iterdir()}, filenames)
+            self.assertEqual({path.name for path in output.iterdir()}, data_filenames)
+            self.assertEqual(
+                {path.name for path in artifacts.iterdir()}, artifact_filenames
+            )
             summary = json.loads(
                 (output / "phase4_summary.json").read_text(encoding="utf-8")
             )
@@ -1059,14 +1072,16 @@ class ProjectEndToEndTest(unittest.TestCase):
             self.assertEqual(by_rule["correct_width"]["successes"], 0)
             self.assertGreater(by_rule["too_narrow"]["ci_lower"], 0.05)
 
-            for filename in filenames:
+            for filename in data_filenames:
                 content = (output / filename).read_text(encoding="utf-8")
                 self.assertNotIn("\u2014", content)
-                if filename.endswith(".svg"):
-                    self.assertIn("<title", content)
-                    self.assertIn("<desc", content)
-                    self.assertIn('role="img"', content)
-            restoration_svg = (output / "experiment_restoration.svg").read_text(
+            for filename in artifact_filenames:
+                content = (artifacts / filename).read_text(encoding="utf-8")
+                self.assertNotIn("\u2014", content)
+                self.assertIn("<title", content)
+                self.assertIn("<desc", content)
+                self.assertIn('role="img"', content)
+            restoration_svg = (artifacts / "experiment_restoration.svg").read_text(
                 encoding="utf-8"
             )
             self.assertIn('stroke-dasharray="7 4"', restoration_svg)
@@ -1079,40 +1094,58 @@ class ProjectEndToEndTest(unittest.TestCase):
             tempfile.TemporaryDirectory() as second_directory,
         ):
             for directory in (first_directory, second_directory):
+                root = Path(directory)
                 repeated = self.run_cli(
                     "run-experiments",
                     "--output-dir",
-                    directory,
+                    str(root / "data"),
+                    "--artifacts-dir",
+                    str(root / "artifacts"),
                     "--replications",
                     "30",
                     "--seed",
                     "19",
                 )
                 self.assertEqual(repeated.returncode, 0, repeated.stderr)
-            for filename in filenames:
+            for filename in data_filenames:
                 self.assertEqual(
-                    (Path(first_directory) / filename).read_bytes(),
-                    (Path(second_directory) / filename).read_bytes(),
+                    (Path(first_directory) / "data" / filename).read_bytes(),
+                    (Path(second_directory) / "data" / filename).read_bytes(),
+                )
+            for filename in artifact_filenames:
+                self.assertEqual(
+                    (Path(first_directory) / "artifacts" / filename).read_bytes(),
+                    (Path(second_directory) / "artifacts" / filename).read_bytes(),
                 )
 
     def test_phase4_publication_failure_restores_every_artifact(self) -> None:
         from src.experiments import run_experiments
 
-        filenames = (
+        data_filenames = (
             "phase4_results.jsonl",
             "phase4_summary.json",
+        )
+        artifact_filenames = (
             "experiment_landscape.svg",
             "experiment_impossibility.svg",
             "experiment_restoration.svg",
         )
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
+            root = Path(directory)
+            output = root / "data"
+            artifacts = root / "artifacts"
+            output.mkdir()
+            artifacts.mkdir()
             previous = {
-                filename: f"previous {filename}\n".encode() for filename in filenames
+                filename: f"previous {filename}\n".encode()
+                for filename in (*data_filenames, *artifact_filenames)
             }
-            for filename, content in previous.items():
-                (output / filename).write_bytes(content)
-            target = output / "experiment_impossibility.svg"
+            for filename in data_filenames:
+                (output / filename).write_bytes(previous[filename])
+            for filename in artifact_filenames:
+                content = previous[filename]
+                (artifacts / filename).write_bytes(content)
+            target = artifacts / "experiment_impossibility.svg"
             real_replace = os.replace
             failure_injected = False
 
@@ -1131,15 +1164,25 @@ class ProjectEndToEndTest(unittest.TestCase):
             ):
                 run_experiments(
                     output,
+                    artifacts_dir=artifacts,
                     data_dir=ROOT / "data",
                     replications=1,
                     seed=9,
                 )
 
             self.assertTrue(failure_injected)
-            self.assertEqual({path.name for path in output.iterdir()}, set(filenames))
-            for filename, content in previous.items():
-                self.assertEqual((output / filename).read_bytes(), content)
+            self.assertEqual(
+                {path.name for path in output.iterdir()}, set(data_filenames)
+            )
+            self.assertEqual(
+                {path.name for path in artifacts.iterdir()}, set(artifact_filenames)
+            )
+            for filename in data_filenames:
+                self.assertEqual((output / filename).read_bytes(), previous[filename])
+            for filename in artifact_filenames:
+                self.assertEqual(
+                    (artifacts / filename).read_bytes(), previous[filename]
+                )
 
 
 if __name__ == "__main__":
