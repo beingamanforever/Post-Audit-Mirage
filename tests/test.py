@@ -2361,12 +2361,47 @@ class ProjectEndToEndTest(unittest.TestCase):
             self.assertTrue(
                 all(not item.safe_to_deploy for item in pair.harmful.protected_truth)
             )
+            for truth in (*pair.safe.protected_truth, *pair.harmful.protected_truth):
+                self.assertTrue(truth.group_harm)
+                self.assertTrue(
+                    all(
+                        record.exposure_mass > 0
+                        and 0 <= record.harm_mass <= record.exposure_mass
+                        for record in truth.group_harm
+                    )
+                )
             for safe_public, harmful_public in zip(
                 pair.safe.public_rounds,
                 pair.harmful.public_rounds,
                 strict=True,
             ):
                 self.assertIs(safe_public.update, harmful_public.update)
+
+            first_safe = pair.safe.protected_truth[0].group_harm
+            first_harmful = pair.harmful.protected_truth[0].group_harm
+            self.assertEqual(
+                tuple(record.exposure_mass for record in first_safe),
+                tuple(record.exposure_mass for record in first_harmful),
+            )
+            if family == "authgate_v0":
+                self.assertEqual(
+                    sum(
+                        (record.exposure_mass for record in first_safe),
+                        Fraction(),
+                    ),
+                    32,
+                )
+            elif family == "constraint_plan_v0":
+                harmful_groups = {record.group: record for record in first_harmful}
+                self.assertEqual(harmful_groups["rare"].harm_mass, 20)
+                self.assertEqual(harmful_groups["rare"].exposure_mass, 20)
+            else:
+                harmful_groups = {record.group: record for record in first_harmful}
+                self.assertEqual(harmful_groups["rare"].harm_mass, Fraction(1, 20))
+                self.assertEqual(
+                    harmful_groups["rare"].exposure_mass,
+                    Fraction(1, 10),
+                )
 
         null_authgate = realize_lifecycle("authgate_v0", "null_only", 31)
         self.assertEqual(null_authgate.public_rounds[7].update.pace_outcomes, ())
@@ -2404,6 +2439,14 @@ class ProjectEndToEndTest(unittest.TestCase):
                 )
 
     def test_phase4_experiments_prove_landscape_limit_and_restoration(self) -> None:
+        from src.experiments import _clopper_pearson_upper
+
+        self.assertAlmostEqual(_clopper_pearson_upper(0, 1), 0.95, places=14)
+        self.assertAlmostEqual(
+            _clopper_pearson_upper(4, 20),
+            0.401028117331975,
+            places=13,
+        )
         artifact_filenames = {
             "experiment_impossibility.svg",
             "experiment_landscape.svg",
@@ -2440,7 +2483,7 @@ class ProjectEndToEndTest(unittest.TestCase):
             self.assertEqual(config["monitor_replications"], 500)
             self.assertEqual(config["seed"], 20260821)
             for family, limit in (
-                ("authgate_v0", 0.05),
+                ("authgate_v0", 0.15),
                 ("constraint_plan_v0", 0.15),
             ):
                 safe_rate, safe_limit = config["monitor_truth"][family]["safe"]
@@ -2466,19 +2509,33 @@ class ProjectEndToEndTest(unittest.TestCase):
             )
             self.assertEqual(
                 summary["experiments"]["experiment_4"]["first_separation_monitor_n"],
-                {"authgate_v0": 20000, "constraint_plan_v0": 500},
+                {"authgate_v0": 2500, "constraint_plan_v0": 500},
             )
 
             rows = read_jsonl(output / "phase4_results.jsonl")
-            self.assertEqual(len(rows), 714)
+            self.assertEqual(len(rows), 1558)
             for row in rows:
                 self.assertIn(row["family"], {"authgate_v0", "constraint_plan_v0"})
-                if row["metric"] in {"first_harm_round", "genuine_acceptance"}:
+                if row["metric"] in {
+                    "first_harm_monitor_n",
+                    "first_harm_round",
+                    "genuine_acceptance",
+                }:
                     self.assertGreaterEqual(row["trials"], 0)
                 else:
                     self.assertGreater(row["trials"], 0)
-                self.assertGreaterEqual(row["estimate"], -50)
-                self.assertLessEqual(row["estimate"], 50)
+                if row["estimate"] is not None:
+                    self.assertGreaterEqual(row["estimate"], -50)
+                    self.assertLessEqual(row["estimate"], 50)
+                elif row["trials"] == 0:
+                    self.assertIn(
+                        row["metric"],
+                        {
+                            "first_harm_monitor_n",
+                            "first_harm_round",
+                            "genuine_acceptance",
+                        },
+                    )
 
             landscape = [
                 row
@@ -2512,9 +2569,17 @@ class ProjectEndToEndTest(unittest.TestCase):
                     row["ci_lower"] is None
                     and row["ci_upper"] is None
                     and row["uncertainty"] == "descriptive_fixed_lifecycle"
+                    and row["sampling_scope"] == "fixed_lifecycle_witness"
                     for row in descriptive
                 )
             )
+            for experiment in ("experiment_2", "experiment_3", "experiment_4"):
+                experiment_metrics = {
+                    row["metric"] for row in rows if row["experiment"] == experiment
+                }
+                self.assertIn("worst_group_harm", experiment_metrics)
+                self.assertIn("group_disparity", experiment_metrics)
+                self.assertIn("worst_group_harmful_lifecycle", experiment_metrics)
 
             lifecycle_rows = read_jsonl(output / "phase4_lifecycles.jsonl")
             self.assertEqual(len(lifecycle_rows), 300)
@@ -2543,6 +2608,15 @@ class ProjectEndToEndTest(unittest.TestCase):
                         expected_safe,
                     )
                     self.assertTrue(all(row["public_components"] for row in selected))
+                    for row in selected:
+                        self.assertTrue(row["truth_group_harm"])
+                        for group in row["truth_group_harm"].values():
+                            exposure = Fraction(group["exposure_mass"])
+                            harm = Fraction(group["harm_mass"])
+                            self.assertGreater(exposure, 0)
+                            self.assertGreaterEqual(harm, 0)
+                            self.assertLessEqual(harm, exposure)
+                            self.assertEqual(Fraction(group["rate"]), harm / exposure)
             observed_modes = {
                 mode
                 for row in lifecycle_rows
@@ -2593,7 +2667,78 @@ class ProjectEndToEndTest(unittest.TestCase):
             ]
             by_rule = {row["method"]: row for row in false_safe}
             self.assertEqual(by_rule["correct_width"]["successes"], 0)
+            self.assertAlmostEqual(
+                by_rule["correct_width"]["ci_upper"],
+                1 - 0.05 ** (1 / 500),
+                places=14,
+            )
+            self.assertEqual(
+                by_rule["correct_width"]["uncertainty"],
+                "exact_one_sided_95_clopper_pearson",
+            )
             self.assertGreater(by_rule["too_narrow"]["ci_lower"], 0.05)
+
+            group_rows = [row for row in rows if row["metric"] == "group_harm"]
+            self.assertTrue(group_rows)
+            for row in group_rows:
+                harm = Fraction(row["harm_mass"])
+                exposure = Fraction(row["exposure_mass"])
+                eligible = Fraction(row["eligible_exposure_mass"])
+                self.assertGreater(eligible, 0)
+                self.assertGreaterEqual(exposure, 0)
+                self.assertLessEqual(exposure, eligible)
+                self.assertGreaterEqual(harm, 0)
+                self.assertLessEqual(harm, exposure)
+                expected = float(harm / exposure) if exposure else None
+                self.assertEqual(row["estimate"], expected)
+
+            observed_monitor = [
+                row for row in rows if row["metric"] == "observed_monitor_harm"
+            ]
+            self.assertEqual(len(observed_monitor), 48)
+            self.assertTrue(
+                all(
+                    row["estimand"] == "pooled_worst_group_harm"
+                    and row["sampling_scope"] == "independent_monitor_observations"
+                    for row in observed_monitor
+                )
+            )
+
+            correct_harmful_groups = [
+                row
+                for row in group_rows
+                if row["experiment"] == "experiment_4"
+                and row["family"] == "authgate_v0"
+                and row["scenario"] == "harmful"
+                and row["method"] == "correct_width"
+            ]
+            narrow_harmful_groups = [
+                row
+                for row in group_rows
+                if row["experiment"] == "experiment_4"
+                and row["family"] == "authgate_v0"
+                and row["scenario"] == "harmful"
+                and row["method"] == "too_narrow"
+            ]
+            self.assertTrue(correct_harmful_groups)
+            self.assertTrue(
+                all(
+                    Fraction(row["exposure_mass"]) == 0 and row["estimate"] is None
+                    for row in correct_harmful_groups
+                )
+            )
+            self.assertTrue(
+                all(Fraction(row["exposure_mass"]) > 0 for row in narrow_harmful_groups)
+            )
+            narrow_acceptances = by_rule["too_narrow"]["successes"]
+            self.assertGreater(narrow_acceptances, 0)
+            self.assertTrue(
+                all(
+                    Fraction(row["exposure_mass"]) * 500
+                    == Fraction(row["eligible_exposure_mass"]) * narrow_acceptances
+                    for row in narrow_harmful_groups
+                )
+            )
 
             for filename in data_filenames:
                 content = (output / filename).read_text(encoding="utf-8")

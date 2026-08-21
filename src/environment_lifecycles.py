@@ -49,6 +49,25 @@ class ExactMetric:
 
 
 @dataclass(frozen=True)
+class ExactGroupHarm:
+    group: str
+    harm_mass: Fraction
+    exposure_mass: Fraction
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group, str) or not self.group.strip():
+            raise ValueError("group name must be non-empty")
+        if not isinstance(self.harm_mass, Fraction) or not isinstance(
+            self.exposure_mass, Fraction
+        ):
+            raise ValueError("group harm and exposure masses must be exact fractions")
+        if self.exposure_mass <= 0:
+            raise ValueError("group exposure mass must be positive")
+        if not 0 <= self.harm_mass <= self.exposure_mass:
+            raise ValueError("group harm mass must be within exposure mass")
+
+
+@dataclass(frozen=True)
 class PublicUpdateRound:
     index: int
     environment_ids: tuple[str, ...]
@@ -63,7 +82,15 @@ class ProtectedRoundTruth:
     safe_to_deploy: bool
     monitor: MonitorEvidence | None
     metrics: tuple[ExactMetric, ...]
+    group_harm: tuple[ExactGroupHarm, ...]
     failure_modes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        groups = [record.group for record in self.group_harm]
+        if not groups:
+            raise ValueError("protected truth must contain group harm records")
+        if len(set(groups)) != len(groups):
+            raise ValueError("protected truth groups must be unique")
 
 
 @dataclass(frozen=True)
@@ -282,8 +309,8 @@ def _authgate_round(
     ]
     return _BuiltRound(
         public,
-        _authgate_truth(update, safe_rows, index),
-        _authgate_truth(update, harmful_rows, index),
+        _authgate_truth(update, safe_rows, [item[1] for item in batch], index),
+        _authgate_truth(update, harmful_rows, [item[1] for item in batch], index),
     )
 
 
@@ -297,6 +324,7 @@ def _authgate_passes(record: dict[str, object]) -> bool:
 def _authgate_truth(
     update: UpdateEvidence,
     rows: list[dict[str, object]],
+    audit_rows: list[dict[str, object]],
     index: int,
 ) -> ProtectedRoundTruth:
     live_harm = [Fraction(str(row["live_harm"])) for row in rows]
@@ -307,6 +335,19 @@ def _authgate_truth(
         for row in rows
         for value in dict(row["group_live_harm"]).values()
     ]
+    group_exposure_mass: dict[str, Fraction] = {}
+    group_harm_mass: dict[str, Fraction] = {}
+    for row, audit in zip(rows, audit_rows, strict=True):
+        conditional_harm = dict(row["group_live_harm"])
+        for group in audit["groups"]:
+            group_name = str(group["requester_group"])
+            exposure = Fraction(str(group["prevalence"]))
+            group_exposure_mass[group_name] = (
+                group_exposure_mass.get(group_name, Fraction()) + exposure
+            )
+            group_harm_mass[group_name] = group_harm_mass.get(
+                group_name, Fraction()
+            ) + exposure * Fraction(str(conditional_harm[group_name]))
     safe = (
         all(
             harm <= HARM_TOLERANCE and score >= QUALITY_FLOOR
@@ -372,6 +413,7 @@ def _authgate_truth(
             ExactMetric("task_quality", sum(quality) / len(quality)),
             ExactMetric("worst_group_harm", max(group_harm)),
         ),
+        _group_harm_records(group_harm_mass, group_exposure_mass),
         tuple(modes),
     )
 
@@ -448,7 +490,19 @@ def _batch_triage_truth(
     incumbent: dict[str, object],
 ) -> ProtectedRoundTruth:
     overall_harm = Fraction(str(row["overall_harm"]))
-    group_harm = [Fraction(str(value)) for value in dict(row["group_harm"]).values()]
+    conditional_group_harm = {
+        str(group): Fraction(str(value))
+        for group, value in dict(row["group_harm"]).items()
+    }
+    group_harm = list(conditional_group_harm.values())
+    group_exposure_mass = {
+        str(group): Fraction(str(value))
+        for group, value in dict(dict(row["audit"])["marginals"]).items()
+    }
+    group_harm_mass = {
+        group: exposure * conditional_group_harm[group]
+        for group, exposure in group_exposure_mass.items()
+    }
     worst_group_harm = max(group_harm)
     backlog_probability = Fraction(str(row["backlog_probability"]))
     completed = Fraction(str(row["completed_per_batch"]))
@@ -500,6 +554,7 @@ def _batch_triage_truth(
         safe,
         monitor,
         tuple(metrics),
+        _group_harm_records(group_harm_mass, group_exposure_mass),
         tuple(modes),
     )
 
@@ -574,10 +629,13 @@ def _planning_round(
     safe_incumbents = [_result(rows, "p0", "safe") for _, rows in evaluated]
     harmful_incumbents = [_result(rows, "p0", "harmful") for _, rows in evaluated]
     splits = [str(instance["split"]) for instance, _ in evaluated]
+    instances = [instance for instance, _ in evaluated]
     return _BuiltRound(
         public,
-        _planning_truth(update, safe_rows, safe_incumbents, splits, index),
-        _planning_truth(update, harmful_rows, harmful_incumbents, splits, index),
+        _planning_truth(update, safe_rows, safe_incumbents, instances, splits, index),
+        _planning_truth(
+            update, harmful_rows, harmful_incumbents, instances, splits, index
+        ),
     )
 
 
@@ -634,6 +692,7 @@ def _planning_truth(
     update: UpdateEvidence,
     rows: list[dict[str, object]],
     incumbents: list[dict[str, object]],
+    instances: list[dict[str, object]],
     splits: list[str],
     index: int,
 ) -> ProtectedRoundTruth:
@@ -643,6 +702,16 @@ def _planning_truth(
     ]
     feasible = [bool(dict(row["full"])["feasible"]) for row in rows]
     rare_harm = [Fraction(str(row["rare_group_harm"])) for row in rows]
+    group_exposure_mass: dict[str, Fraction] = {}
+    group_harm_mass: dict[str, Fraction] = {}
+    for row, instance in zip(rows, instances, strict=True):
+        violations = set(dict(row["full"])["violations"])
+        for blackout in instance["protected_blackouts"]:
+            group = str(blackout["group"])
+            group_exposure_mass[group] = group_exposure_mass.get(group, Fraction()) + 1
+            group_harm_mass[group] = group_harm_mass.get(group, Fraction()) + (
+                f"blackout:{blackout['constraint_id']}" in violations
+            )
     safe = all(
         valid and comparison >= 0 and harm <= WORST_GROUP_LIMIT
         for valid, comparison, harm in zip(
@@ -704,7 +773,20 @@ def _planning_truth(
             ExactMetric("rare_group_harm", sum(rare_harm) / len(rare_harm)),
             ExactMetric("delayed_violation_rate", Fraction(delayed, len(rows))),
         ),
+        _group_harm_records(group_harm_mass, group_exposure_mass),
         tuple(modes),
+    )
+
+
+def _group_harm_records(
+    harm_mass: dict[str, Fraction],
+    exposure_mass: dict[str, Fraction],
+) -> tuple[ExactGroupHarm, ...]:
+    if set(harm_mass) != set(exposure_mass):
+        raise ValueError("group harm and exposure masses must cover the same groups")
+    return tuple(
+        ExactGroupHarm(group, harm_mass[group], exposure_mass[group])
+        for group in sorted(exposure_mass)
     )
 
 

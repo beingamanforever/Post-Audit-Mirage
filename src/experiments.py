@@ -10,14 +10,16 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Iterable
 
-from .decision_methods import ALPHA, Oracle, build_public_methods
+from .decision_methods import ALPHA, Decision, Oracle, build_public_methods
 from .environment_lifecycles import (
     MatchedLifecyclePair,
+    ProtectedRoundTruth,
     RealizedLifecycle,
     realize_lifecycle,
     realize_matched_pair,
 )
 from .experiment_plots import impossibility_svg, landscape_svg, restoration_svg
+from .lifecycle import WORST_GROUP_LIMIT
 
 FAMILIES = ("authgate_v0", "constraint_plan_v0")
 SCENARIOS = ("null_only", "all_good", "mixed")
@@ -34,7 +36,7 @@ OFFLINE_METHODS = (
     "sgm_transferred",
 )
 MONITOR_SIZES = (5, 10, 20, 50, 100, 200, 500, 1000, 2500, 5000, 10000, 20000)
-ONE_SIDED_95_Z = 1.6448536269514722
+ONE_SIDED_CONFIDENCE = 0.95
 
 
 def run_experiments(
@@ -79,7 +81,13 @@ def run_experiments(
     monitor_settings = _monitor_settings(matched_pairs)
     landscape = _run_landscape(lifecycles, seed, alpha)
     impossibility = _run_impossibility(matched_pairs, seed, alpha)
-    restoration = _run_restoration(replications, seed, alpha, monitor_settings)
+    restoration = _run_restoration(
+        replications,
+        seed,
+        alpha,
+        monitor_settings,
+        matched_pairs,
+    )
     rows = landscape + impossibility + restoration
     summary = {
         "config": {
@@ -123,9 +131,7 @@ def _run_landscape(
     seed: int,
     alpha: float,
 ) -> list[dict[str, object]]:
-    counts: dict[tuple[str, str, str], dict[str, float]] = defaultdict(
-        lambda: defaultdict(float)
-    )
+    rows: list[dict[str, object]] = []
     for family in FAMILIES:
         for scenario in SCENARIOS:
             lifecycle = lifecycles[(family, scenario)]
@@ -150,6 +156,9 @@ def _run_landscape(
                 good_deployed = 0
                 good_total = 0
                 utility = 0
+                abstentions = 0
+                group_harmful = False
+                group_totals = _group_totals(lifecycle.protected_truth)
                 for round_index, (public, truth) in enumerate(
                     zip(
                         lifecycle.public_rounds,
@@ -160,6 +169,9 @@ def _run_landscape(
                 ):
                     monitor = truth.monitor if method.name == "monitor" else None
                     decision = method.decide(public.update, monitor)
+                    abstentions += decision.reason == "live-style stream unavailable"
+                    _add_deployed_group_truth(group_totals, truth, decision.deploy)
+                    group_harmful |= decision.deploy and _has_harmful_group(truth)
                     is_safe = truth.safe_to_deploy
                     if is_safe:
                         good_total += 1
@@ -169,60 +181,73 @@ def _run_landscape(
                         harmful_deployed = True
                         first_harm = first_harm or round_index
                         utility -= 1
-                key = (family, scenario, method.name)
-                counts[key]["harm_lifecycles"] += harmful_deployed
-                counts[key]["good_deployed"] += good_deployed
-                counts[key]["good_total"] += good_total
-                counts[key]["first_harm_sum"] += first_harm
-                counts[key]["first_harm_count"] += bool(first_harm)
-                counts[key]["utility_sum"] += utility
-
-    rows: list[dict[str, object]] = []
-    for (family, scenario, method), values in sorted(counts.items()):
-        rows.append(
-            _descriptive_rate_row(
-                "experiment_2",
-                family,
-                scenario,
-                method,
-                "harmful_lifecycle",
-                int(values["harm_lifecycles"]),
-                1,
-            )
-        )
-        rows.append(
-            _descriptive_rate_row(
-                "experiment_2",
-                family,
-                scenario,
-                method,
-                "genuine_acceptance",
-                int(values["good_deployed"]),
-                int(values["good_total"]),
-            )
-        )
-        rows.append(
-            _descriptive_mean_row(
-                "experiment_2",
-                family,
-                scenario,
-                method,
-                "first_harm_round",
-                values["first_harm_sum"],
-                int(values["first_harm_count"]),
-            )
-        )
-        rows.append(
-            _descriptive_mean_row(
-                "experiment_2",
-                family,
-                scenario,
-                method,
-                "final_utility",
-                values["utility_sum"],
-                1,
-            )
-        )
+                rows.extend(
+                    (
+                        _descriptive_rate_row(
+                            "experiment_2",
+                            family,
+                            scenario,
+                            method.name,
+                            "harmful_lifecycle",
+                            int(harmful_deployed),
+                            1,
+                        ),
+                        _descriptive_rate_row(
+                            "experiment_2",
+                            family,
+                            scenario,
+                            method.name,
+                            "worst_group_harmful_lifecycle",
+                            int(group_harmful),
+                            1,
+                        ),
+                        _descriptive_rate_row(
+                            "experiment_2",
+                            family,
+                            scenario,
+                            method.name,
+                            "genuine_acceptance",
+                            good_deployed,
+                            good_total,
+                        ),
+                        _descriptive_rate_row(
+                            "experiment_2",
+                            family,
+                            scenario,
+                            method.name,
+                            "explicit_abstention",
+                            abstentions,
+                            len(lifecycle.public_rounds),
+                        ),
+                        _descriptive_mean_row(
+                            "experiment_2",
+                            family,
+                            scenario,
+                            method.name,
+                            "first_harm_round",
+                            first_harm,
+                            int(bool(first_harm)),
+                        ),
+                        _descriptive_mean_row(
+                            "experiment_2",
+                            family,
+                            scenario,
+                            method.name,
+                            "final_utility",
+                            utility,
+                            1,
+                        ),
+                    )
+                )
+                rows.extend(
+                    _group_metric_rows(
+                        "experiment_2",
+                        family,
+                        scenario,
+                        method.name,
+                        group_totals,
+                    )
+                )
     return rows
 
 
@@ -263,6 +288,16 @@ def _lifecycle_rows(
                         )
                         for metric in truth.metrics
                     },
+                    "truth_group_harm": {
+                        record.group: {
+                            "exposure_mass": _fraction_text(record.exposure_mass),
+                            "harm_mass": _fraction_text(record.harm_mass),
+                            "rate": _fraction_text(
+                                record.harm_mass / record.exposure_mass
+                            ),
+                        }
+                        for record in truth.group_harm
+                    },
                     "update_id": public.update.update_id,
                     "world": truth.world,
                 }
@@ -275,9 +310,8 @@ def _run_impossibility(
     seed: int,
     alpha: float,
 ) -> list[dict[str, object]]:
-    accepted: dict[tuple[str, str, str], int] = defaultdict(int)
     matched: dict[tuple[str, str], int] = defaultdict(int)
-    abstained: dict[str, int] = defaultdict(int)
+    rows: list[dict[str, object]] = []
     for family in FAMILIES:
         pair = matched_pairs[family]
         decisions: dict[str, dict[str, tuple[object, ...]]] = {}
@@ -302,32 +336,20 @@ def _run_impossibility(
                     )
                     for decision in lifecycle_decisions
                 )
-                accepted[(family, world, method.name)] += any(
-                    decision.deploy for decision in lifecycle_decisions
+                rows.extend(
+                    _offline_lifecycle_rows(
+                        family,
+                        world,
+                        method.name,
+                        lifecycle,
+                        lifecycle_decisions,
+                    )
                 )
         for method in OFFLINE_METHODS:
             matched[(family, method)] += (
                 decisions["safe"][method] == decisions["harmful"][method]
             )
-        abstained[family] += (
-            identified_range_status(frozenset({True, False})) == "cannot_determine"
-        )
-
-    rows: list[dict[str, object]] = []
-    for family in FAMILIES:
         for method in OFFLINE_METHODS:
-            for world in ("safe", "harmful"):
-                rows.append(
-                    _descriptive_rate_row(
-                        "experiment_3",
-                        family,
-                        world,
-                        method,
-                        "acceptance",
-                        accepted[(family, world, method)],
-                        1,
-                    )
-                )
             rows.append(
                 _descriptive_rate_row(
                     "experiment_3",
@@ -340,17 +362,205 @@ def _run_impossibility(
                 )
             )
         for world in ("safe", "harmful"):
-            rows.append(
-                _descriptive_rate_row(
-                    "experiment_3",
-                    family,
-                    world,
-                    "identified_range",
-                    "cannot_determine",
-                    abstained[family],
-                    1,
+            cannot_determine = int(
+                identified_range_status(frozenset({True, False})) == "cannot_determine"
+            )
+            rows.extend(
+                (
+                    _descriptive_rate_row(
+                        "experiment_3",
+                        family,
+                        world,
+                        "identified_range",
+                        "cannot_determine",
+                        cannot_determine,
+                        1,
+                    ),
+                    _descriptive_rate_row(
+                        "experiment_3",
+                        family,
+                        world,
+                        "identified_range",
+                        "explicit_abstention",
+                        cannot_determine,
+                        1,
+                    ),
                 )
             )
+    return rows
+
+
+def _offline_lifecycle_rows(
+    family: str,
+    world: str,
+    method: str,
+    lifecycle: RealizedLifecycle,
+    decisions: tuple[Decision, ...],
+) -> list[dict[str, object]]:
+    harmful_deployed = False
+    group_harmful = False
+    good_deployed = 0
+    good_total = 0
+    first_harm = 0
+    utility = 0
+    group_totals = _group_totals(lifecycle.protected_truth)
+    for round_index, (decision, truth) in enumerate(
+        zip(decisions, lifecycle.protected_truth, strict=True), start=1
+    ):
+        deploy = bool(decision.deploy)
+        _add_deployed_group_truth(group_totals, truth, deploy)
+        group_harmful |= deploy and _has_harmful_group(truth)
+        if truth.safe_to_deploy:
+            good_total += 1
+            good_deployed += deploy
+            utility += deploy
+        elif deploy:
+            harmful_deployed = True
+            first_harm = first_harm or round_index
+            utility -= 1
+    rows = [
+        _descriptive_rate_row(
+            "experiment_3",
+            family,
+            world,
+            method,
+            "acceptance",
+            int(any(bool(decision.deploy) for decision in decisions)),
+            1,
+        ),
+        _descriptive_rate_row(
+            "experiment_3",
+            family,
+            world,
+            method,
+            "harmful_lifecycle",
+            int(harmful_deployed),
+            1,
+        ),
+        _descriptive_rate_row(
+            "experiment_3",
+            family,
+            world,
+            method,
+            "worst_group_harmful_lifecycle",
+            int(group_harmful),
+            1,
+        ),
+        _descriptive_rate_row(
+            "experiment_3",
+            family,
+            world,
+            method,
+            "genuine_acceptance",
+            good_deployed,
+            good_total,
+        ),
+        _descriptive_mean_row(
+            "experiment_3",
+            family,
+            world,
+            method,
+            "first_harm_round",
+            first_harm,
+            int(bool(first_harm)),
+        ),
+        _descriptive_mean_row(
+            "experiment_3",
+            family,
+            world,
+            method,
+            "final_utility",
+            utility,
+            1,
+        ),
+    ]
+    rows.extend(_group_metric_rows("experiment_3", family, world, method, group_totals))
+    return rows
+
+
+def _group_totals(
+    truths: tuple[ProtectedRoundTruth, ...],
+) -> dict[str, list[Fraction]]:
+    totals: dict[str, list[Fraction]] = {}
+    for truth in truths:
+        for record in truth.group_harm:
+            values = totals.setdefault(
+                record.group, [Fraction(), Fraction(), Fraction()]
+            )
+            values[2] += record.exposure_mass
+    return totals
+
+
+def _add_deployed_group_truth(
+    totals: dict[str, list[Fraction]],
+    truth: ProtectedRoundTruth,
+    deployed: bool,
+) -> None:
+    if not deployed:
+        return
+    for record in truth.group_harm:
+        values = totals[record.group]
+        values[0] += record.harm_mass
+        values[1] += record.exposure_mass
+
+
+def _has_harmful_group(truth: ProtectedRoundTruth) -> bool:
+    return any(
+        record.harm_mass / record.exposure_mass > WORST_GROUP_LIMIT
+        for record in truth.group_harm
+    )
+
+
+def _group_metric_rows(
+    experiment: str,
+    family: str,
+    scenario: str,
+    method: str,
+    totals: dict[str, list[Fraction]],
+) -> list[dict[str, object]]:
+    rates = [
+        harm_mass / exposure_mass
+        for harm_mass, exposure_mass, _ in totals.values()
+        if exposure_mass
+    ]
+    rows = [
+        _descriptive_value_row(
+            experiment,
+            family,
+            scenario,
+            method,
+            "worst_group_harm",
+            float(max(rates)) if rates else None,
+        ),
+        _descriptive_value_row(
+            experiment,
+            family,
+            scenario,
+            method,
+            "group_disparity",
+            float(max(rates) - min(rates)) if rates else None,
+        ),
+    ]
+    for group, (harm_mass, exposure_mass, eligible_exposure_mass) in sorted(
+        totals.items()
+    ):
+        row = _descriptive_value_row(
+            experiment,
+            family,
+            scenario,
+            method,
+            "group_harm",
+            float(harm_mass / exposure_mass) if exposure_mass else None,
+        )
+        row.update(
+            {
+                "eligible_exposure_mass": _fraction_text(eligible_exposure_mass),
+                "exposure_mass": _fraction_text(exposure_mass),
+                "group": group,
+                "harm_mass": _fraction_text(harm_mass),
+            }
+        )
+        rows.append(row)
     return rows
 
 
@@ -359,10 +569,17 @@ def _run_restoration(
     seed: int,
     alpha: float,
     settings: dict[str, dict[str, tuple[float, float]]],
+    matched_pairs: dict[str, MatchedLifecyclePair],
 ) -> list[dict[str, object]]:
     counts: dict[tuple[str, str, str, int, str], int] = defaultdict(int)
     estimates: dict[tuple[str, str, int], float] = defaultdict(float)
+    observed_harm: dict[tuple[str, str, int], int] = defaultdict(int)
     false_safe_lifecycles: dict[tuple[str, str], int] = defaultdict(int)
+    genuine_acceptance: dict[tuple[str, str], int] = defaultdict(int)
+    explicit_abstention: dict[tuple[str, str, str], int] = defaultdict(int)
+    first_harm_sum: dict[tuple[str, str], int] = defaultdict(int)
+    first_harm_count: dict[tuple[str, str], int] = defaultdict(int)
+    utility_sum: dict[tuple[str, str, str], int] = defaultdict(int)
     for family in FAMILIES:
         for world in ("safe", "harmful"):
             probability, limit = settings[family][world]
@@ -371,6 +588,9 @@ def _run_restoration(
                 harm_count = 0
                 previous_n = 0
                 false_safe = {"correct_width": False, "too_narrow": False}
+                accepted_safe = {"correct_width": False, "too_narrow": False}
+                determined = {"correct_width": False, "too_narrow": False}
+                first_harm = {"correct_width": 0, "too_narrow": 0}
                 for monitor_n in MONITOR_SIZES:
                     harm_count += sum(
                         random_source.random() < probability
@@ -378,6 +598,7 @@ def _run_restoration(
                     )
                     previous_n = monitor_n
                     estimate = harm_count / monitor_n
+                    observed_harm[(family, world, monitor_n)] += harm_count
                     estimates[(family, world, monitor_n)] += estimate
                     statuses = {
                         "correct_width": _confidence_sequence_status(
@@ -388,8 +609,19 @@ def _run_restoration(
                     for rule, status in statuses.items():
                         counts[(family, world, rule, monitor_n, status)] += 1
                         false_safe[rule] |= world == "harmful" and status == "safe"
+                        accepted_safe[rule] |= world == "safe" and status == "safe"
+                        determined[rule] |= status != "cannot_determine"
+                        if world == "harmful" and status == "safe":
+                            first_harm[rule] = first_harm[rule] or monitor_n
                 for rule, occurred in false_safe.items():
                     false_safe_lifecycles[(family, rule)] += occurred
+                    genuine_acceptance[(family, rule)] += accepted_safe[rule]
+                    explicit_abstention[(family, world, rule)] += not determined[rule]
+                    first_harm_sum[(family, rule)] += first_harm[rule]
+                    first_harm_count[(family, rule)] += bool(first_harm[rule])
+                    utility_sum[(family, world, rule)] += int(
+                        accepted_safe[rule]
+                    ) - int(occurred)
 
     rows: list[dict[str, object]] = []
     for family in FAMILIES:
@@ -431,6 +663,105 @@ def _run_restoration(
                 )
                 row["monitor_n"] = 0
                 rows.append(row)
+                group_harm_row = _rate_row(
+                    "experiment_4",
+                    family,
+                    world,
+                    rule,
+                    "worst_group_harmful_lifecycle",
+                    false_safe_lifecycles[(family, rule)] if world == "harmful" else 0,
+                    replications,
+                )
+                group_harm_row["monitor_n"] = 0
+                rows.append(group_harm_row)
+                genuine_row = _rate_row(
+                    "experiment_4",
+                    family,
+                    world,
+                    rule,
+                    "genuine_acceptance_lifecycle",
+                    genuine_acceptance[(family, rule)] if world == "safe" else 0,
+                    replications,
+                )
+                genuine_row["monitor_n"] = 0
+                rows.append(genuine_row)
+                abstention_row = _rate_row(
+                    "experiment_4",
+                    family,
+                    world,
+                    rule,
+                    "explicit_abstention_lifecycle",
+                    explicit_abstention[(family, world, rule)],
+                    replications,
+                )
+                abstention_row["monitor_n"] = 0
+                rows.append(abstention_row)
+                first_harm_row = _mean_row(
+                    "experiment_4",
+                    family,
+                    world,
+                    rule,
+                    "first_harm_monitor_n",
+                    first_harm_sum[(family, rule)] if world == "harmful" else 0,
+                    first_harm_count[(family, rule)] if world == "harmful" else 0,
+                )
+                first_harm_row["monitor_n"] = 0
+                first_harm_row["sampling_scope"] = "independent_monitor_streams"
+                first_harm_row["uncertainty"] = (
+                    "descriptive_conditional_on_harmful_acceptance"
+                )
+                rows.append(first_harm_row)
+                utility_row = _mean_row(
+                    "experiment_4",
+                    family,
+                    world,
+                    rule,
+                    "final_utility",
+                    utility_sum[(family, world, rule)],
+                    replications,
+                )
+                utility_row["monitor_n"] = 0
+                utility_row["sampling_scope"] = "independent_monitor_streams"
+                utility_row["uncertainty"] = "descriptive_monitor_replications"
+                rows.append(utility_row)
+                lifecycle = (
+                    matched_pairs[family].safe
+                    if world == "safe"
+                    else matched_pairs[family].harmful
+                )
+                accepted_lifecycles = (
+                    genuine_acceptance[(family, rule)]
+                    if world == "safe"
+                    else false_safe_lifecycles[(family, rule)]
+                )
+                group_totals = _replicated_group_totals(
+                    lifecycle.protected_truth,
+                    accepted_lifecycles,
+                    replications,
+                )
+                rows.extend(
+                    _group_metric_rows(
+                        "experiment_4",
+                        family,
+                        world,
+                        rule,
+                        group_totals,
+                    )
+                )
+            for monitor_n in MONITOR_SIZES:
+                observed_row = _rate_row(
+                    "experiment_4",
+                    family,
+                    world,
+                    "monitor_stream",
+                    "observed_monitor_harm",
+                    observed_harm[(family, world, monitor_n)],
+                    replications * monitor_n,
+                )
+                observed_row["estimand"] = "pooled_worst_group_harm"
+                observed_row["monitor_n"] = monitor_n
+                observed_row["sampling_scope"] = "independent_monitor_observations"
+                rows.append(observed_row)
     return rows
 
 
@@ -582,24 +913,40 @@ def _restoration_status(rows: list[dict[str, object]]) -> dict[str, object]:
 def _monitor_settings(
     matched_pairs: dict[str, MatchedLifecyclePair],
 ) -> dict[str, dict[str, tuple[float, float]]]:
-    limits = {"authgate_v0": 0.05, "constraint_plan_v0": 0.15}
     settings = {}
     for family in FAMILIES:
         pair = matched_pairs[family]
-        metric_name = "live_harm" if family == "authgate_v0" else "rare_group_harm"
         settings[family] = {}
         for world, lifecycle in (("safe", pair.safe), ("harmful", pair.harmful)):
-            values = [
-                metric.value
-                for truth in lifecycle.protected_truth
-                for metric in truth.metrics
-                if metric.name == metric_name
-            ]
             settings[family][world] = (
-                float(sum(values, Fraction()) / len(values)),
-                limits[family],
+                float(_pooled_worst_group_harm(lifecycle.protected_truth)),
+                float(WORST_GROUP_LIMIT),
             )
     return settings
+
+
+def _pooled_worst_group_harm(
+    truths: tuple[ProtectedRoundTruth, ...],
+) -> Fraction:
+    totals = _group_totals(truths)
+    for truth in truths:
+        _add_deployed_group_truth(totals, truth, True)
+    return max(harm / exposure for harm, exposure, _ in totals.values())
+
+
+def _replicated_group_totals(
+    truths: tuple[ProtectedRoundTruth, ...],
+    deployed_lifecycles: int,
+    eligible_lifecycles: int,
+) -> dict[str, list[Fraction]]:
+    totals = _group_totals(truths)
+    for truth in truths:
+        _add_deployed_group_truth(totals, truth, True)
+    for values in totals.values():
+        values[0] *= deployed_lifecycles
+        values[1] *= deployed_lifecycles
+        values[2] *= eligible_lifecycles
+    return totals
 
 
 def _confidence_sequence_status(
@@ -643,11 +990,11 @@ def _rate_row(
     successes: int,
     trials: int,
 ) -> dict[str, object]:
-    lower, upper = _wilson(successes, trials)
+    lower, upper = _clopper_pearson(successes, trials)
     return {
         "ci_lower": lower,
         "ci_upper": upper,
-        "estimate": successes / trials if trials else 0.0,
+        "estimate": successes / trials,
         "experiment": experiment,
         "family": family,
         "method": method,
@@ -655,6 +1002,8 @@ def _rate_row(
         "scenario": scenario,
         "successes": successes,
         "trials": trials,
+        "uncertainty": "exact_one_sided_95_clopper_pearson",
+        "sampling_scope": "independent_monitor_streams",
     }
 
 
@@ -670,7 +1019,7 @@ def _descriptive_rate_row(
     return {
         "ci_lower": None,
         "ci_upper": None,
-        "estimate": successes / trials if trials else 0.0,
+        "estimate": successes / trials if trials else None,
         "experiment": experiment,
         "family": family,
         "method": method,
@@ -679,6 +1028,7 @@ def _descriptive_rate_row(
         "successes": successes,
         "trials": trials,
         "uncertainty": "descriptive_fixed_lifecycle",
+        "sampling_scope": "fixed_lifecycle_witness",
     }
 
 
@@ -694,7 +1044,7 @@ def _mean_row(
     return {
         "ci_lower": None,
         "ci_upper": None,
-        "estimate": value_sum / trials if trials else 0.0,
+        "estimate": value_sum / trials if trials else None,
         "experiment": experiment,
         "family": family,
         "method": method,
@@ -724,24 +1074,147 @@ def _descriptive_mean_row(
         trials,
     )
     row["uncertainty"] = "descriptive_fixed_lifecycle"
+    row["sampling_scope"] = "fixed_lifecycle_witness"
     return row
 
 
-def _wilson(successes: int, trials: int) -> tuple[float, float]:
-    if trials < 1:
-        return 0.0, 1.0
-    proportion = successes / trials
-    z_squared = ONE_SIDED_95_Z * ONE_SIDED_95_Z
-    denominator = 1 + z_squared / trials
-    center = (proportion + z_squared / (2 * trials)) / denominator
-    radius = (
-        ONE_SIDED_95_Z
-        * math.sqrt(
-            proportion * (1 - proportion) / trials + z_squared / (4 * trials * trials)
-        )
-        / denominator
+def _descriptive_value_row(
+    experiment: str,
+    family: str,
+    scenario: str,
+    method: str,
+    metric: str,
+    estimate: float | None,
+) -> dict[str, object]:
+    return {
+        "ci_lower": None,
+        "ci_upper": None,
+        "estimate": estimate,
+        "experiment": experiment,
+        "family": family,
+        "method": method,
+        "metric": metric,
+        "sampling_scope": "fixed_lifecycle_witness",
+        "scenario": scenario,
+        "trials": 1,
+        "uncertainty": "descriptive_fixed_lifecycle",
+    }
+
+
+def _fraction_text(value: Fraction) -> str:
+    return f"{value.numerator}/{value.denominator}"
+
+
+def _clopper_pearson(successes: int, trials: int) -> tuple[float, float]:
+    if trials < 1 or not 0 <= successes <= trials:
+        raise ValueError("exact binomial bounds require 0 <= successes <= trials")
+    upper = _clopper_pearson_upper(successes, trials)
+    lower = 1 - _clopper_pearson_upper(trials - successes, trials)
+    return max(0.0, lower), min(1.0, upper)
+
+
+def _clopper_pearson_upper(successes: int, trials: int) -> float:
+    if trials < 1 or not 0 <= successes <= trials:
+        raise ValueError("exact binomial bounds require 0 <= successes <= trials")
+    if successes == trials:
+        return 1.0
+    alpha = 1 - ONE_SIDED_CONFIDENCE
+    if successes == 0:
+        value = -math.expm1(math.log(alpha) / trials)
+        return math.nextafter(value, 1.0)
+
+    target = math.log(alpha)
+    low, high = 0.0, 1.0
+    for _ in range(80):
+        middle = (low + high) / 2
+        if _log_binomial_cdf(successes, trials, middle) > target:
+            low = middle
+        else:
+            high = middle
+    return math.nextafter(high, 1.0)
+
+
+def _log_binomial_cdf(successes: int, trials: int, probability: float) -> float:
+    if probability <= 0:
+        return 0.0
+    if probability >= 1:
+        return -math.inf if successes < trials else 0.0
+    value = _regularized_beta(
+        1 - probability,
+        trials - successes,
+        successes + 1,
     )
-    return max(0.0, center - radius), min(1.0, center + radius)
+    return math.log(value) if value else -math.inf
+
+
+def _regularized_beta(value: float, first: float, second: float) -> float:
+    if value <= 0:
+        return 0.0
+    if value >= 1:
+        return 1.0
+    log_factor = (
+        math.lgamma(first + second)
+        - math.lgamma(first)
+        - math.lgamma(second)
+        + first * math.log(value)
+        + second * math.log1p(-value)
+    )
+    direct = value < (first + 1) / (first + second + 2)
+    if log_factor < -745:
+        return 0.0 if direct else 1.0
+    if direct:
+        return (
+            math.exp(log_factor)
+            * _beta_continued_fraction(first, second, value)
+            / first
+        )
+    complement = (
+        math.exp(log_factor)
+        * _beta_continued_fraction(second, first, 1 - value)
+        / second
+    )
+    return max(0.0, 1 - complement)
+
+
+def _beta_continued_fraction(first: float, second: float, value: float) -> float:
+    total = first + second
+    first_plus_one = first + 1
+    first_minus_one = first - 1
+    fraction = 1 - total * value / first_plus_one
+    fraction = fraction if abs(fraction) > 1e-300 else 1e-300
+    fraction = 1 / fraction
+    numerator = 1.0
+    result = fraction
+    for index in range(1, 1001):
+        doubled = 2 * index
+        coefficient = (
+            index
+            * (second - index)
+            * value
+            / ((first_minus_one + doubled) * (first + doubled))
+        )
+        fraction = 1 + coefficient * fraction
+        fraction = fraction if abs(fraction) > 1e-300 else 1e-300
+        numerator = 1 + coefficient / numerator
+        numerator = numerator if abs(numerator) > 1e-300 else 1e-300
+        fraction = 1 / fraction
+        result *= fraction * numerator
+        coefficient = (
+            -(first + index)
+            * (total + index)
+            * value
+            / ((first + doubled) * (first_plus_one + doubled))
+        )
+        fraction = 1 + coefficient * fraction
+        fraction = fraction if abs(fraction) > 1e-300 else 1e-300
+        numerator = 1 + coefficient / numerator
+        numerator = numerator if abs(numerator) > 1e-300 else 1e-300
+        fraction = 1 / fraction
+        change = fraction * numerator
+        result *= change
+        if abs(change - 1) <= 3e-14:
+            return result
+    raise ArithmeticError("exact binomial bound did not converge")
 
 
 def _find(
