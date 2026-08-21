@@ -3088,6 +3088,225 @@ class ProjectEndToEndTest(unittest.TestCase):
             self.assertAlmostEqual(row["ci_lower"], 0.36, places=14)
             self.assertAlmostEqual(row["ci_upper"], 0.3726666666666667, places=14)
 
+    def test_multiseed_lifecycle_evaluation_is_paired_and_reproducible(self) -> None:
+        import struct
+        from xml.etree import ElementTree
+
+        from src.decision_methods import METHOD_NAMES
+        from src.multiseed_experiments import _publish, run_multiseed_experiments
+
+        lifecycle_templates = {
+            scenario: realize_lifecycle("batch_triage_v0", scenario, 707)
+            for scenario in ("null_only", "all_good", "mixed")
+        }
+        test_png = (
+            b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR"
+            + struct.pack(">II", 3000, 1840)
+            + b"\x08\x06\x00\x00\x00"
+        )
+
+        def realize_test_lifecycle(
+            family: str,
+            scenario: str,
+            seed: int,
+            *,
+            planning_templates: Path,
+        ) -> object:
+            self.assertIn(
+                family,
+                {"authgate_v0", "constraint_plan_v0", "batch_triage_v0"},
+            )
+            self.assertGreaterEqual(seed, 0)
+            self.assertTrue(planning_templates.is_file())
+            return lifecycle_templates[scenario]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_data = root / "first-data"
+            first_artifacts = root / "first-artifacts"
+            second_data = root / "second-data"
+            second_artifacts = root / "second-artifacts"
+            with (
+                patch(
+                    "src.multiseed_experiments.realize_lifecycle",
+                    side_effect=realize_test_lifecycle,
+                ),
+                patch(
+                    "src.multiseed_experiments._render_png",
+                    return_value=test_png,
+                ),
+                patch("src.multiseed_experiments._preflight_renderer"),
+            ):
+                first = run_multiseed_experiments(
+                    first_data,
+                    first_artifacts,
+                    ROOT / "data",
+                    seed=73,
+                )
+                second = run_multiseed_experiments(
+                    second_data,
+                    second_artifacts,
+                    ROOT / "data",
+                    seed=73,
+                )
+
+            data_names = {
+                "multiseed_outcomes.jsonl",
+                "multiseed_inference.json",
+                "multiseed_summary.json",
+                "multiseed_variation.jsonl",
+            }
+            self.assertEqual({path.name for path in first_data.iterdir()}, data_names)
+            self.assertEqual(
+                {path.name for path in first_artifacts.iterdir()},
+                {
+                    "multiseed_method_comparison.png",
+                    "multiseed_method_comparison.svg",
+                },
+            )
+            for name in data_names:
+                self.assertEqual(
+                    (first_data / name).read_bytes(),
+                    (second_data / name).read_bytes(),
+                )
+            first_svg = first_artifacts / "multiseed_method_comparison.svg"
+            first_png = first_artifacts / "multiseed_method_comparison.png"
+            self.assertEqual(
+                first_svg.read_bytes(),
+                (second_artifacts / first_svg.name).read_bytes(),
+            )
+            ElementTree.fromstring(first_svg.read_text(encoding="utf-8"))
+            self.assertNotIn("\N{EM DASH}", first_svg.read_text(encoding="utf-8"))
+            self.assertEqual(first_png.read_bytes(), test_png)
+            self.assertEqual(struct.unpack(">II", test_png[16:24]), (3000, 1840))
+
+            config = first["config"]
+            self.assertEqual(config["primary_lifecycles"], 900)
+            self.assertEqual(config["png_renderer"], "sharp_0.35.3")
+            self.assertEqual(config["primary_update_rounds"], 45_000)
+            self.assertEqual(config["primary_outcome_rows"], 900 * len(METHOD_NAMES))
+            self.assertEqual(config["environment_seeds"], 900)
+            self.assertEqual(config["lifecycle_seeds"], 1_170)
+            self.assertEqual(config["method_seeds"], 1_980)
+            self.assertEqual(config["variation_lifecycles"], 1_080)
+            self.assertEqual(
+                config["variation_outcome_rows"], 1_080 * len(METHOD_NAMES)
+            )
+            self.assertEqual(first, second)
+            for cell in first["cell_summaries"]:
+                self.assertEqual(cell["harmful_lifecycle_trials"], 100)
+                self.assertEqual(
+                    cell["harmful_lifecycle_uncertainty"],
+                    "exact_one_sided_95_clopper_pearson",
+                )
+                self.assertGreaterEqual(cell["harmful_lifecycle_ci_lower"], 0)
+                self.assertLessEqual(cell["harmful_lifecycle_ci_upper"], 1)
+                if cell["harmful_lifecycle_successes"] == 0:
+                    self.assertGreater(cell["harmful_lifecycle_ci_upper"], 0)
+
+            outcomes = read_jsonl(first_data / "multiseed_outcomes.jsonl")
+            variation = read_jsonl(first_data / "multiseed_variation.jsonl")
+            inference = json.loads(
+                (first_data / "multiseed_inference.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(outcomes), 900 * len(METHOD_NAMES))
+            self.assertEqual(len(variation), 1_080 * len(METHOD_NAMES))
+            self.assertEqual(
+                len(
+                    {
+                        (row["family"], row["scenario"], row["environment_seed"])
+                        for row in outcomes
+                    }
+                ),
+                900,
+            )
+            self.assertEqual({row["method"] for row in outcomes}, set(METHOD_NAMES))
+            for row in outcomes:
+                self.assertEqual(row["panel"], "primary")
+                self.assertEqual(row["environment_index"] in range(100), True)
+            always_hold = [
+                row
+                for row in outcomes
+                if row["method"] == "always_hold" and row["scenario"] == "null_only"
+            ]
+            self.assertTrue(always_hold)
+            self.assertTrue(
+                all(
+                    row["abstention"]
+                    and row["first_harmful_acceptance"] is None
+                    and row["worst_group_harm"] is None
+                    for row in always_hold
+                )
+            )
+            self.assertEqual(
+                [row["hypothesis_id"] for row in inference["comparisons"]],
+                ["H1", "H2", "H3", "H4", "H5", "H6"],
+            )
+
+            targets = tuple(first_data / name for name in sorted(data_names)) + (
+                first_svg,
+                first_png,
+            )
+            previous = {target: target.read_bytes() for target in targets}
+            real_replace = os.replace
+            failed = False
+
+            def fail_svg_once(source: Path, destination: Path) -> None:
+                nonlocal failed
+                if Path(destination) == first_svg and not failed:
+                    failed = True
+                    raise OSError("injected multi-seed publication failure")
+                real_replace(source, destination)
+
+            with (
+                patch(
+                    "src.multiseed_experiments.os.replace",
+                    side_effect=fail_svg_once,
+                ),
+                self.assertRaises(OSError),
+            ):
+                _publish(
+                    {
+                        target: b"replacement\n"
+                        if target.suffix == ".png"
+                        else "replacement\n"
+                        for target in targets
+                    }
+                )
+            self.assertTrue(failed)
+            self.assertEqual(
+                {target: target.read_bytes() for target in targets},
+                previous,
+            )
+
+            invalid = self.run_cli(
+                "run-multiseed-experiments",
+                "--output-dir",
+                str(root / "invalid-data"),
+                "--artifacts-dir",
+                str(root / "invalid-artifacts"),
+                "--workers",
+                "0",
+            )
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn("workers must be an integer", invalid.stderr)
+
+            with (
+                patch(
+                    "src.multiseed_experiments._preflight_renderer",
+                    side_effect=ValueError("missing pinned renderer"),
+                ),
+                patch("src.multiseed_experiments.realize_lifecycle") as realize,
+                self.assertRaisesRegex(ValueError, "missing pinned renderer"),
+            ):
+                run_multiseed_experiments(
+                    root / "preflight-data",
+                    root / "preflight-artifacts",
+                    ROOT / "data",
+                )
+            realize.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

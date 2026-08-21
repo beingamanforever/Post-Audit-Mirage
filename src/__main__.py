@@ -13,6 +13,7 @@ from .environment_validation import (
 )
 from .experiments import run_experiments
 from .lifecycle import run_methods
+from .multiseed_experiments import run_multiseed_experiments
 from .surface_generation import (
     DEFAULT_ENDPOINT,
     SurfaceGenerationError,
@@ -92,6 +93,14 @@ def _parser() -> argparse.ArgumentParser:
     experiments.add_argument("--replications", type=int, default=500)
     experiments.add_argument("--seed", type=int, default=20260821)
     experiments.add_argument("--alpha", type=float, default=0.05)
+
+    multiseed = commands.add_parser("run-multiseed-experiments")
+    multiseed.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    multiseed.add_argument("--output-dir", type=Path, default=DATA_DIR)
+    multiseed.add_argument("--artifacts-dir", type=Path, default=ARTIFACTS_DIR)
+    multiseed.add_argument("--seed", type=int, default=20260821)
+    multiseed.add_argument("--workers", type=int, default=1)
+    multiseed.add_argument("--node-modules", type=Path)
     return parser
 
 
@@ -164,6 +173,20 @@ def main() -> int:
             print(
                 f"wrote Phase 4 data to {arguments.output_dir} and plots to "
                 f"{arguments.artifacts_dir}: {statuses}"
+            )
+            return 0
+        if arguments.command == "run-multiseed-experiments":
+            summary = run_multiseed_experiments(
+                arguments.output_dir,
+                arguments.artifacts_dir,
+                arguments.data_dir,
+                seed=arguments.seed,
+                workers=arguments.workers,
+                node_modules=arguments.node_modules,
+            )
+            print(
+                "wrote multi-seed lifecycle data and plot: "
+                f"{summary['inference_overall_label']}"
             )
             return 0
         instances, _ = validate_environments(
