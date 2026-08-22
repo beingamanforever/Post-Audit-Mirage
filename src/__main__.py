@@ -12,6 +12,7 @@ from .environment_validation import (
     validate_environments,
 )
 from .experiments import run_experiments
+from .identifiability_experiments import run_identifiability_experiments
 from .lifecycle import run_methods
 from .multiseed_experiments import run_multiseed_experiments
 from .surface_generation import (
@@ -101,6 +102,13 @@ def _parser() -> argparse.ArgumentParser:
     multiseed.add_argument("--seed", type=int, default=20260821)
     multiseed.add_argument("--workers", type=int, default=1)
     multiseed.add_argument("--node-modules", type=Path)
+
+    identifiability = commands.add_parser("run-identifiability-experiments")
+    identifiability.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    identifiability.add_argument("--output-dir", type=Path, default=DATA_DIR)
+    identifiability.add_argument("--artifacts-dir", type=Path, default=ARTIFACTS_DIR)
+    identifiability.add_argument("--seed", type=int, default=20260821)
+    identifiability.add_argument("--workers", type=int, default=1)
     return parser
 
 
@@ -186,7 +194,20 @@ def main() -> int:
             )
             print(
                 "wrote multi-seed lifecycle data and plot: "
-                f"{summary['inference_overall_label']}"
+                f"{summary['secondary_analysis']}"
+            )
+            return 0
+        if arguments.command == "run-identifiability-experiments":
+            summary = run_identifiability_experiments(
+                arguments.output_dir,
+                arguments.artifacts_dir,
+                arguments.data_dir,
+                seed=arguments.seed,
+                workers=arguments.workers,
+            )
+            print(
+                "wrote identifiability evidence and figures: "
+                f"{summary['witnesses']['observed_rows']} matched update witnesses"
             )
             return 0
         instances, _ = validate_environments(

@@ -278,6 +278,7 @@ def _lifecycle_rows(
                         for component in public.update.components
                     ],
                     "public_failure_modes": list(public.failure_modes),
+                    "public_monitor_groups": list(public.monitor_groups),
                     "round": public.index + 1,
                     "safe_to_deploy": truth.safe_to_deploy,
                     "scenario": lifecycle.scenario,

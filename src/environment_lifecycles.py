@@ -73,7 +73,14 @@ class PublicUpdateRound:
     environment_ids: tuple[str, ...]
     proposal_id: str
     update: UpdateEvidence
+    monitor_groups: tuple[str, ...]
     failure_modes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.monitor_groups or len(set(self.monitor_groups)) != len(
+            self.monitor_groups
+        ):
+            raise ValueError("monitor groups must be nonempty and unique")
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,7 @@ class RealizedLifecycle:
 class MatchedLifecyclePair:
     safe: RealizedLifecycle
     harmful: RealizedLifecycle
+    semantic_structure: tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
         if self.safe.public_rounds is not self.harmful.public_rounds:
@@ -123,6 +131,7 @@ class _BuiltRound:
     public: PublicUpdateRound
     safe: ProtectedRoundTruth
     harmful: ProtectedRoundTruth
+    semantic_structure: tuple[object, ...]
 
 
 def realize_lifecycle(
@@ -201,7 +210,8 @@ def realize_matched_pair(
         raise ValueError(f"{family} matched safe truth is not deployable")
     if any(truth.safe_to_deploy for truth in harmful.protected_truth):
         raise ValueError(f"{family} matched harmful truth is deployable")
-    return MatchedLifecyclePair(safe, harmful)
+    semantic_structure = tuple(item.semantic_structure for item in rounds)
+    return MatchedLifecyclePair(safe, harmful, semantic_structure)
 
 
 def _validate_inputs(family: str, scenario: str, seed: int) -> None:
@@ -298,6 +308,15 @@ def _authgate_round(
         tuple(str(item[0]["instance_id"]) for item in batch),
         Policy.CANDIDATE.value,
         update,
+        tuple(
+            sorted(
+                {
+                    str(group["requester_group"])
+                    for _, audit, _, _, _ in batch
+                    for group in audit["groups"]
+                }
+            )
+        ),
         tuple(public_modes),
     )
     safe_rows = [
@@ -311,6 +330,7 @@ def _authgate_round(
         public,
         _authgate_truth(update, safe_rows, [item[1] for item in batch], index),
         _authgate_truth(update, harmful_rows, [item[1] for item in batch], index),
+        tuple(_semantic_value(item[0]) for item in batch),
     )
 
 
@@ -471,6 +491,7 @@ def _batch_triage_round(
         (str(instance["instance_id"]),),
         BatchPolicy.CANDIDATE.value,
         update,
+        tuple(sorted(str(group["group_id"]) for group in instance["groups"])),
         tuple(modes),
     )
     safe = _result(rows, BatchPolicy.CANDIDATE.value, "safe")
@@ -481,6 +502,7 @@ def _batch_triage_round(
         public,
         _batch_triage_truth(update, safe, safe_incumbent),
         _batch_triage_truth(update, harmful, harmful_incumbent),
+        (_semantic_value(instance),),
     )
 
 
@@ -594,6 +616,10 @@ def _planning_round(
     comparisons = [
         _comparison(candidate, incumbent) for candidate, incumbent in public_results
     ]
+    margins = [
+        _objective_margin(candidate, incumbent)
+        for candidate, incumbent in public_results
+    ]
     update = UpdateEvidence(
         PLAN_FAMILY,
         update_id,
@@ -606,7 +632,7 @@ def _planning_round(
                 ],
                 require_all=True,
             ),
-            _component("objective", [float(value) for value in comparisons]),
+            _component("objective", [float(value) for value in margins]),
         ),
         tuple(int(value > 0) for value in comparisons if value),
     )
@@ -622,6 +648,15 @@ def _planning_round(
         tuple(str(instance["instance_id"]) for instance, _ in evaluated),
         proposal,
         update,
+        tuple(
+            sorted(
+                {
+                    str(blackout["group"])
+                    for instance, _ in evaluated
+                    for blackout in instance["protected_blackouts"]
+                }
+            )
+        ),
         tuple(public_modes),
     )
     safe_rows = [_result(rows, proposal, "safe") for _, rows in evaluated]
@@ -636,6 +671,7 @@ def _planning_round(
         _planning_truth(
             update, harmful_rows, harmful_incumbents, instances, splits, index
         ),
+        tuple(_semantic_value(instance) for instance in instances[:4]),
     )
 
 
@@ -659,6 +695,18 @@ def _planning_bank(
             for instance in instances
         )
     return tuple(evaluated)
+
+
+def _semantic_value(value: object) -> object:
+    if isinstance(value, dict):
+        return tuple(
+            (key, _semantic_value(item))
+            for key, item in sorted(value.items())
+            if key not in {"instance_id", "seed"}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_semantic_value(item) for item in value)
+    return value
 
 
 def _planning_proposal(
@@ -698,6 +746,10 @@ def _planning_truth(
 ) -> ProtectedRoundTruth:
     comparisons = [
         _comparison(row["full"], incumbent["full"])
+        for row, incumbent in zip(rows, incumbents, strict=True)
+    ]
+    margins = [
+        _objective_margin(row["full"], incumbent["full"])
         for row, incumbent in zip(rows, incumbents, strict=True)
     ]
     feasible = [bool(dict(row["full"])["feasible"]) for row in rows]
@@ -741,7 +793,7 @@ def _planning_truth(
                 require_all=True,
             ),
             ComponentEvidence(
-                "objective", tuple(float(comparisons[item]) for item in monitor_rows)
+                "objective", tuple(float(margins[item]) for item in monitor_rows)
             ),
             ComponentEvidence(
                 "worst_group",
@@ -769,6 +821,10 @@ def _planning_truth(
             ExactMetric(
                 "objective_noninferior_rate",
                 Fraction(sum(value >= 0 for value in comparisons), len(comparisons)),
+            ),
+            ExactMetric(
+                "objective_margin_mean",
+                sum(margins, Fraction()) / len(margins),
             ),
             ExactMetric("rare_group_harm", sum(rare_harm) / len(rare_harm)),
             ExactMetric("delayed_violation_rate", Fraction(delayed, len(rows))),
@@ -827,6 +883,27 @@ def _comparison(candidate: object, incumbent: object) -> int:
     return (candidate_objective < incumbent_objective) - (
         candidate_objective > incumbent_objective
     )
+
+
+def _objective_margin(candidate: object, incumbent: object) -> Fraction:
+    candidate_result = dict(candidate)  # type: ignore[arg-type]
+    incumbent_result = dict(incumbent)  # type: ignore[arg-type]
+    candidate_feasible = bool(candidate_result["feasible"])
+    incumbent_feasible = bool(incumbent_result["feasible"])
+    if candidate_feasible != incumbent_feasible:
+        return Fraction(1 if candidate_feasible else -1)
+    if not candidate_feasible:
+        return Fraction()
+    for candidate_value, incumbent_value in zip(
+        candidate_result["objective"], incumbent_result["objective"], strict=True
+    ):
+        candidate_exact = Fraction(candidate_value)
+        incumbent_exact = Fraction(incumbent_value)
+        if candidate_exact != incumbent_exact:
+            difference = incumbent_exact - candidate_exact
+            scale = abs(candidate_exact) + abs(incumbent_exact) + 1
+            return difference / scale
+    return Fraction()
 
 
 def _bounded_seed(seed: int, index: int, stride: int) -> int:

@@ -549,6 +549,10 @@ def _summary(
             "environments_per_cell": ENVIRONMENTS_PER_CELL,
             "families": list(FAMILIES),
             "globally_unique_seed_roles": True,
+            "independence_scope": (
+                "nominal seed runs; BatchTriage contains 72 evaluator-distinct "
+                "semantic strata"
+            ),
             "lifecycle_length": LIFECYCLE_LENGTH,
             "lifecycle_seeds": len(lifecycle_seeds),
             "method_seeds": len(method_seeds),
@@ -583,7 +587,8 @@ def _summary(
                 * len(METHOD_NAMES)
             ),
         },
-        "inference_overall_label": inference["overall_label"],
+        "secondary_analysis": inference["analysis"],
+        "secondary_criteria_met_for": inference["criteria_met_for"],
         "seed_variation": variation,
     }
 
@@ -622,24 +627,17 @@ def _comparison_svg(
         "shrinking_budget": "#0F9D8A",
         "oracle": "#D9485F",
     }
-    claim_labels = {
-        "best": "PASSES FROZEN TESTS VS BOTH",
-        "superior_to_addis_spending": "PASSES FROZEN TEST VS ADDIS ONLY",
-        "superior_to_shrinking_budget": "PASSES FROZEN TEST VS SHRINKING ONLY",
-        "no_superiority_established": "NO SUPERIORITY ESTABLISHED",
-    }
-    overall_label = str(inference["overall_label"])
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-labelledby="title description">',
-        '<title id="title">Multi-seed lifecycle method comparison</title>',
-        '<desc id="description">Primary outcomes from 900 independent exact environment lifecycles across AuthGate, ConstraintPlan, and BatchTriage.</desc>',
+        '<title id="title">Secondary multi-seed protocol characterization</title>',
+        '<desc id="description">Descriptive primary outcomes from 900 nominal lifecycle runs across AuthGate, ConstraintPlan, and BatchTriage.</desc>',
         '<rect width="1500" height="920" fill="#F7F9FC"/>',
         '<style>text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}</style>',
-        _svg_text(55, 62, "Multi-seed lifecycle benchmark", 31, "#183153", 600),
+        _svg_text(55, 62, "Secondary protocol characterization", 31, "#183153", 600),
         _svg_text(
             55,
             96,
-            "900 independent 50-update lifecycles  |  three exact environment families  |  paired methods",
+            "900 nominal 50-update runs  |  three exact environment families  |  paired protocol effects",
             15,
             "#68768A",
         ),
@@ -647,7 +645,7 @@ def _comparison_svg(
         _svg_text(
             1277,
             69,
-            claim_labels.get(overall_label, overall_label.replace("_", " ").upper()),
+            "SECONDARY DIAGNOSTIC ONLY",
             12,
             "#183153",
             600,
@@ -715,7 +713,7 @@ def _comparison_svg(
             _svg_text(
                 55,
                 892,
-                "Dots are descriptive averages across prespecified cells. The frozen paired claim passes only versus shrinking budget; family-specific effects vary.",
+                "Dots are descriptive averages across prespecified cells. This diagnostic is separate from the central identifiability result.",
                 13,
                 "#68768A",
             ),

@@ -2544,13 +2544,20 @@ class ProjectEndToEndTest(unittest.TestCase):
                 and row["scenario"] == "mixed"
                 and row["metric"] == "harmful_lifecycle"
             ]
+            landscape_by_key = {
+                (row["family"], row["method"]): row["successes"] for row in landscape
+            }
             self.assertTrue(
                 all(
-                    row["successes"] == 1
-                    for row in landscape
-                    if row["method"]
-                    in {"addis_spending", "online_closed_e", "sgm_transferred"}
+                    landscape_by_key[(family, "sgm_transferred")] == 1
+                    for family in ("authgate_v0", "constraint_plan_v0")
                 )
+            )
+            self.assertEqual(
+                landscape_by_key[("constraint_plan_v0", "addis_spending")], 0
+            )
+            self.assertEqual(
+                landscape_by_key[("constraint_plan_v0", "online_closed_e")], 0
             )
             self.assertTrue(
                 all(
@@ -2907,6 +2914,272 @@ class ProjectEndToEndTest(unittest.TestCase):
                     (artifacts / filename).read_bytes(), previous[filename]
                 )
 
+    def test_identified_range_monitor_is_group_aware_and_fail_closed(self) -> None:
+        from src.identified_range_monitor import monitor_identified_range
+
+        ambiguous = frozenset((True, False))
+        empty = monitor_identified_range(
+            ambiguous,
+            ("common", "rare"),
+            {"common": 0, "rare": 0},
+            {"common": 0, "rare": 0},
+            harm_threshold=0.15,
+            lifecycle_alpha=0.05,
+            collection_design="representative",
+        )
+        self.assertEqual(empty.status, "cannot_determine")
+        self.assertEqual(
+            [(bound.group, bound.lower, bound.upper) for bound in empty.bounds],
+            [("common", 0.0, 1.0), ("rare", 0.0, 1.0)],
+        )
+
+        safe = monitor_identified_range(
+            ambiguous,
+            ("common", "rare"),
+            {"common": 0, "rare": 0},
+            {"common": 10_000, "rare": 10_000},
+            harm_threshold=0.15,
+            lifecycle_alpha=0.05,
+            collection_design="outcome_independent_missingness",
+        )
+        self.assertEqual(safe.status, "deploy")
+        self.assertTrue(all(bound.upper < 0.04 for bound in safe.bounds))
+
+        harmful = monitor_identified_range(
+            ambiguous,
+            ("common", "rare"),
+            {"common": 0, "rare": 3_000},
+            {"common": 10_000, "rare": 10_000},
+            harm_threshold=0.15,
+            lifecycle_alpha=0.05,
+            collection_design="representative",
+        )
+        self.assertEqual(harmful.status, "hold")
+        self.assertGreater(harmful.bounds[1].lower, 0.15)
+
+        sparse = monitor_identified_range(
+            ambiguous,
+            ("common", "rare"),
+            {"common": 0, "rare": 0},
+            {"common": 10_000, "rare": 100},
+            harm_threshold=0.15,
+            lifecycle_alpha=0.05,
+            collection_design="representative",
+        )
+        self.assertEqual(sparse.status, "cannot_determine")
+        self.assertGreater(sparse.bounds[1].upper, 0.15)
+
+        for design in ("outcome_dependent_selection", "distribution_shift"):
+            unsupported = monitor_identified_range(
+                ambiguous,
+                ("common", "rare"),
+                {"common": 0, "rare": 0},
+                {"common": 0, "rare": 0},
+                harm_threshold=0.15,
+                lifecycle_alpha=0.05,
+                collection_design=design,
+            )
+            self.assertEqual(unsupported.status, "unsupported")
+
+        for answers, expected in (
+            (frozenset((True,)), "deploy"),
+            (frozenset((False,)), "hold"),
+        ):
+            identified = monitor_identified_range(
+                answers,
+                ("common",),
+                {"common": 0},
+                {"common": 0},
+                harm_threshold=0.15,
+                lifecycle_alpha=0.05,
+                collection_design="representative",
+            )
+            self.assertEqual(identified.status, expected)
+            self.assertEqual(identified.bounds, ())
+
+        matched_pairs = {}
+        for family in ("authgate_v0", "constraint_plan_v0", "batch_triage_v0"):
+            pair = realize_matched_pair(family, 17)
+            matched_pairs[family] = (pair,)
+            for public, safe_truth, harmful_truth in zip(
+                pair.safe.public_rounds,
+                pair.safe.protected_truth,
+                pair.harmful.protected_truth,
+                strict=True,
+            ):
+                self.assertEqual(
+                    set(public.monitor_groups),
+                    {record.group for record in safe_truth.group_harm},
+                )
+                self.assertEqual(
+                    set(public.monitor_groups),
+                    {record.group for record in harmful_truth.group_harm},
+                )
+
+        from src.identifiability_experiments import _offline_witnesses
+
+        matched_pairs["authgate_v0"] += (realize_matched_pair("authgate_v0", 18),)
+        _, _, uniqueness = _offline_witnesses(
+            matched_pairs,
+            seed=17,
+            units={
+                "authgate_v0": 2,
+                "constraint_plan_v0": 1,
+                "batch_triage_v0": 1,
+            },
+        )
+        self.assertEqual(uniqueness["method_facing"]["authgate_v0"], 1)
+        self.assertEqual(uniqueness["environment_structure"]["authgate_v0"], 2)
+
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            monitor_identified_range(
+                ambiguous,
+                ("common", "rare"),
+                {"common": 0},
+                {"common": 0, "rare": 0},
+                harm_threshold=0.15,
+                lifecycle_alpha=0.05,
+                collection_design="representative",
+            )
+
+    def test_identifiability_evaluation_runs_three_families_end_to_end(self) -> None:
+        from xml.etree import ElementTree
+
+        from src.identifiability_experiments import run_identifiability_experiments
+
+        semantic_units = {
+            "authgate_v0": 1,
+            "constraint_plan_v0": 1,
+            "batch_triage_v0": 1,
+        }
+        with (
+            tempfile.TemporaryDirectory() as first_directory,
+            tempfile.TemporaryDirectory() as second_directory,
+        ):
+            outputs = []
+            for directory in (first_directory, second_directory):
+                root = Path(directory)
+                output = root / "data"
+                artifacts = root / "artifacts"
+                summary = run_identifiability_experiments(
+                    output,
+                    artifacts,
+                    ROOT / "data",
+                    seed=91,
+                    semantic_units=semantic_units,
+                    exact_streams=3,
+                    controlled_streams=10,
+                    monitor_sizes=(20, 100),
+                )
+                outputs.append((output, artifacts, summary))
+
+            first_data, first_artifacts, summary = outputs[0]
+            second_data, second_artifacts, replay = outputs[1]
+            self.assertEqual(summary, replay)
+            self.assertEqual(summary["config"]["semantic_units"], semantic_units)
+            self.assertEqual(summary["witnesses"]["observed_rows"], 150)
+            self.assertEqual(
+                summary["witnesses"]["normalized_signature_uniqueness"],
+                {
+                    "method_facing": semantic_units,
+                    "environment_structure": semantic_units,
+                },
+            )
+            self.assertTrue(summary["witnesses"]["all_offline_decisions_match"])
+            self.assertTrue(
+                all(
+                    row["ci_lower"] is None
+                    and row["ci_upper"] is None
+                    and row["uncertainty"]
+                    == "descriptive_fixed_panel_no_population_interval"
+                    for row in summary["exact_family"]
+                )
+            )
+            self.assertEqual(len(summary["controlled_panel"]), 18)
+            self.assertEqual(
+                {row["status"] for row in summary["assumption_checks"]},
+                {"cannot_determine", "unsupported"},
+            )
+            self.assertTrue(all(row["passed"] for row in summary["assumption_checks"]))
+            self.assertTrue(
+                all(
+                    not row["valid_method"]
+                    and not row["included_in_method_performance"]
+                    for row in summary["invalid_ablations"]
+                )
+            )
+
+            witnesses = read_jsonl(first_data / "identifiability_witnesses.jsonl")
+            self.assertEqual(len(witnesses), 150)
+            self.assertEqual({row["family"] for row in witnesses}, set(semantic_units))
+            self.assertTrue(
+                all(
+                    row["public_observations_match"]
+                    and row["offline_decisions_match"]
+                    and row["safe_answer"]
+                    and not row["harmful_answer"]
+                    for row in witnesses
+                )
+            )
+
+            trials = read_jsonl(first_data / "monitor_trials.jsonl")
+            self.assertEqual(len(trials), 378)
+            self.assertEqual(
+                {row["panel"] for row in trials}, {"exact_family", "controlled"}
+            )
+            for row in trials:
+                terminal = None
+                for look in row["looks"]:
+                    if terminal is not None:
+                        self.assertEqual(look["status"], terminal)
+                    elif look["status"] in {"deploy", "hold"}:
+                        terminal = look["status"]
+
+            expected_data = {
+                "identifiability_summary.json",
+                "identifiability_witnesses.jsonl",
+                "monitor_trials.jsonl",
+            }
+            expected_artifacts = {
+                "identifiability_restoration.svg",
+                "monitor_sample_complexity.svg",
+            }
+            self.assertEqual(
+                {path.name for path in first_data.iterdir()}, expected_data
+            )
+            self.assertEqual(
+                {path.name for path in first_artifacts.iterdir()}, expected_artifacts
+            )
+            for name in expected_data:
+                self.assertEqual(
+                    (first_data / name).read_bytes(),
+                    (second_data / name).read_bytes(),
+                )
+            for name in expected_artifacts:
+                first = first_artifacts / name
+                self.assertEqual(
+                    first.read_bytes(), (second_artifacts / name).read_bytes()
+                )
+                content = first.read_text(encoding="utf-8")
+                ElementTree.fromstring(content)
+                self.assertIn("<title", content)
+                self.assertIn("<desc", content)
+                self.assertIn('role="img"', content)
+                self.assertNotIn("\N{EM DASH}", content)
+                self.assertNotIn("winner", content.lower())
+
+            invalid = self.run_cli(
+                "run-identifiability-experiments",
+                "--output-dir",
+                str(Path(first_directory) / "invalid-data"),
+                "--artifacts-dir",
+                str(Path(first_directory) / "invalid-artifacts"),
+                "--workers",
+                "0",
+            )
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn("workers must be an integer", invalid.stderr)
+
     def test_paired_inference_controls_multiplicity_end_to_end(self) -> None:
         from src.paired_inference import (
             LifecycleOutcome,
@@ -2964,12 +3237,17 @@ class ProjectEndToEndTest(unittest.TestCase):
         result = run_paired_inference(outcomes)
         replay = run_paired_inference(reversed(outcomes))
         self.assertEqual(result, replay)
-        self.assertEqual(result["overall_label"], "best")
+        self.assertEqual(
+            result["analysis"], "secondary_synthetic_protocol_characterization"
+        )
+        self.assertEqual(
+            result["criteria_met_for"], ["addis_spending", "shrinking_budget"]
+        )
         self.assertEqual(
             [row["hypothesis_id"] for row in result["comparisons"]],
             ["H1", "H2", "H3", "H4", "H5", "H6"],
         )
-        self.assertTrue(all(row["claim_eligible"] for row in result["comparisons"]))
+        self.assertTrue(all(row["criterion_met"] for row in result["comparisons"]))
         self.assertTrue(all(row["adjusted_p"] <= 0.05 for row in result["comparisons"]))
 
         tied = [
@@ -2987,7 +3265,7 @@ class ProjectEndToEndTest(unittest.TestCase):
             for outcome in outcomes
         ]
         tied_result = run_paired_inference(tied)
-        self.assertEqual(tied_result["overall_label"], "no_superiority_established")
+        self.assertEqual(tied_result["criteria_met_for"], [])
         self.assertTrue(
             all(
                 row["informative_pairs"] == 0 and row["raw_p"] == 1
@@ -3052,7 +3330,7 @@ class ProjectEndToEndTest(unittest.TestCase):
             for outcome in outcomes
         ]
         reversal_result = run_paired_inference(reversal)
-        self.assertEqual(reversal_result["overall_label"], "no_superiority_established")
+        self.assertEqual(reversal_result["criteria_met_for"], [])
         self.assertTrue(
             all(
                 "family_harm_direction_reversal" in row["failure_reasons"]

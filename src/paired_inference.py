@@ -169,7 +169,7 @@ def run_paired_inference(
     for row in rows:
         row["adjusted_p"] = adjusted[str(row["hypothesis_id"])]
         failure = _hypothesis_failure(row, alpha)
-        row["claim_eligible"] = failure is None
+        row["criterion_met"] = failure is None
         row["failure_reason"] = failure
 
     family_effects = _family_effect_rows(indexed)
@@ -180,26 +180,25 @@ def run_paired_inference(
     passing = [
         str(result["comparator"])
         for result in comparator_results
-        if result["superiority_established"]
+        if result["all_prespecified_criteria_met"]
     ]
-    if len(passing) == len(COMPARATORS):
-        overall_label = "best"
-    elif len(passing) == 1:
-        overall_label = f"superior_to_{passing[0]}"
-    else:
-        overall_label = "no_superiority_established"
 
     return {
+        "analysis": "secondary_synthetic_protocol_characterization",
         "candidate": CANDIDATE,
         "comparisons": rows,
         "comparator_results": comparator_results,
+        "criteria_met_for": passing,
         "family_effects": family_effects,
-        "overall_label": overall_label,
         "settings": {
             "alpha": alpha,
             "bootstrap_samples": bootstrap_samples,
             "bootstrap_seed": bootstrap_seed,
+            "interpretation": "secondary_characterization_not_method_ranking",
             "interval": "paired_stratified_percentile_bootstrap",
+            "known_semantic_limit": (
+                "BatchTriage nominal seeds repeat 72 evaluator-distinct semantics"
+            ),
             "multiplicity": "holm_over_six_prespecified_hypotheses",
         },
     }
@@ -345,7 +344,7 @@ def _hypothesis_row(
             else exact_one_sided_sign_p(wins, losses)
         ),
         "adjusted_p": None,
-        "claim_eligible": False,
+        "criterion_met": False,
         "failure_reason": None,
     }
 
@@ -489,12 +488,12 @@ def _comparator_result(
     failures = [
         f"{row['hypothesis_id']}:{row['failure_reason']}"
         for row in comparison_rows
-        if not row["claim_eligible"]
+        if not row["criterion_met"]
     ]
     if reversal:
         failures.append("family_harm_direction_reversal")
     return {
         "comparator": comparator,
-        "superiority_established": not failures,
+        "all_prespecified_criteria_met": not failures,
         "failure_reasons": failures,
     }
