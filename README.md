@@ -12,7 +12,7 @@ Any deterministic offline rule must therefore return the same action in both wor
 
 The same conclusion holds for a randomized rule when its auxiliary randomness has the same law in both worlds.
 
-If a rule requires wrong-action risk at most \(\delta\) in each world, it must abstain with probability at least \(1 - 2\delta\) on this pair.
+If a rule requires wrong-action risk at most $\delta$ in each world, it must abstain with probability at least $1 - 2\delta$ on this pair.
 
 The executable benchmark constructs 272 identifier-independent semantic lifecycle pairs across AuthGate, ConstraintPlan, and BatchTriage.
 
@@ -28,19 +28,19 @@ It returns one of four states: `deploy`, `hold`, `cannot_determine`, or `unsuppo
 
 Without monitoring, an ambiguous compatible answer set returns `cannot_determine`.
 
-For a public roster of \(G\) required groups, group \(g\), and its \(n_g\)-th observed binary outcome, the monitor spends
+For a public roster of $G$ required groups, group $g$, and its $n_g$-th observed binary outcome, the monitor spends
 
-\[
+$$
 \alpha_{g,n_g} = \frac{\alpha}{G n_g(n_g + 1)}
-\]
+$$
 
 and applies a two-sided Hoeffding radius
 
-\[
+$$
 r_{g,n_g} = \sqrt{\frac{\log(2 / \alpha_{g,n_g})}{2n_g}}.
-\]
+$$
 
-The spending is simultaneous across groups and all observation counts because \(\sum_{n \ge 1} 1/(n(n+1)) = 1\).
+The spending is simultaneous across groups and all observation counts because $\sum_{n \ge 1} 1/(n(n+1)) = 1$.
 
 The method deploys only when every group upper bound is at or below the harm threshold, holds when any group lower bound is above it, and otherwise continues to abstain.
 
